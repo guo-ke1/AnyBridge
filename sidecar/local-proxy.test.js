@@ -700,3 +700,47 @@ test('ResolveTarget: smart model-name inference only when nothing is explicit', 
     '显式 apiFormat 必须赢过模型名推断',
   );
 });
+
+test('upstreamErrorText: 空响应 / 拦截页 / 无 message 的 JSON 都算"没信息"', () => {
+  const { upstreamErrorText } = __localProxyTest;
+  assert.equal(upstreamErrorText(''), '');
+  assert.equal(upstreamErrorText('   '), '');
+  assert.equal(upstreamErrorText(undefined), '');
+  assert.equal(upstreamErrorText('<html><body>403 Forbidden</body></html>'), '');
+  assert.equal(upstreamErrorText('{"error":{"code":403}}'), '');
+  assert.equal(upstreamErrorText('{"error":{"message":"模型未开通"}}'), '模型未开通');
+  assert.equal(upstreamErrorText('{"detail":"rate limited"}'), 'rate limited');
+  assert.equal(upstreamErrorText('{"error":"plain string error"}'), 'plain string error');
+  assert.equal(upstreamErrorText('plain text failure'), 'plain text failure');
+});
+
+test('failureMessage: 空 403 必须写成"上游返回空响应"而不是空字符串', () => {
+  const { failureMessage } = __localProxyTest;
+  // responses 路径在空 body 时会把 message 退化成 "HTTP 403" 占位，摘要里不能再重复
+  assert.equal(
+    failureMessage({ providerName: '渠道A', statusCode: 403, message: 'HTTP 403', body: '' }),
+    '渠道A HTTP 403（上游返回空响应）',
+  );
+  // HTML 拦截页原样塞进摘要没有可读性
+  assert.equal(
+    failureMessage({ providerName: '渠道B', statusCode: 403, message: '<html>blocked</html>', body: '<html>blocked</html>' }),
+    '渠道B HTTP 403（上游返回空响应）',
+  );
+  assert.equal(
+    failureMessage({ providerName: '渠道C', statusCode: 403, message: 'HTTP 403', body: '{"error":{"message":"模型未开通"}}' }),
+    '渠道C HTTP 403：模型未开通',
+  );
+  assert.equal(
+    failureMessage({ providerName: '渠道D', code: 'ECONNREFUSED', message: 'connect ECONNREFUSED 127.0.0.1:1' }),
+    '渠道D ECONNREFUSED：connect ECONNREFUSED 127.0.0.1:1',
+  );
+});
+
+test('classifyFailures: 空 403 归类为权限错误（供下游给出可读提示）', () => {
+  const { classifyFailures } = __localProxyTest;
+  assert.deepEqual(classifyFailures([{ statusCode: 403, message: 'HTTP 403', body: '' }]), {
+    status: 403,
+    type: 'permission_error',
+  });
+});
+

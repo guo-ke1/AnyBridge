@@ -1,6 +1,6 @@
 [package]
 name = "anybridge"
-version = "0.5.28"
+version = "0.5.29"
 description = "AnyBridge desktop client"
 authors = ["soulvon"]
 edition = "2021"
@@ -31,6 +31,8 @@ base64 = "0.22"
 flate2 = "1"
 dirs = "5"
 rcgen = "0.13"
+# rcgen 的 not_before / not_after 用 time::OffsetDateTime，需要显式设置证书有效期
+time = "0.3"
 json5 = "0.4"
 toml_edit = "0.22"
 tauri-plugin-updater = "2"

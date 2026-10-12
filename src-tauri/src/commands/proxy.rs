@@ -930,6 +930,9 @@ fn run_proxy_preflight(
     let mut san_ok = std::fs::read_to_string(&san_marker_path)
         .map(|s| s.trim() == crate::commands::system::mitm_cert_san_version())
         .unwrap_or(false);
+    // 证书被重生（SAN 版本升级 / 临近到期）后密钥也换了，信任库里那张同 CN 的旧证书已经对不上，
+    // 必须连带重装，否则"正在用的人"升级后反而连不上（旧指纹验不了新链）。
+    let mut cert_regenerated = false;
     let mut cert_contents_ok = cert_ok
         && key_ok
         && crate::commands::system::validate_mitm_cert_files(&cert_path, &key_path).is_ok();
@@ -999,7 +1002,7 @@ fn run_proxy_preflight(
                 ),
             );
         }
-    } else if !san_ok {
+    } else if !san_ok || crate::commands::system::mitm_certs_need_renewal(&cert_dir) {
         if repair {
             match crate::commands::system::ensure_mitm_certs_ex(true) {
                 Ok((dir, _)) => {
@@ -1007,6 +1010,7 @@ fn run_proxy_preflight(
                         .map(|s| s.trim() == crate::commands::system::mitm_cert_san_version())
                         .unwrap_or(false);
                     if san_ok {
+                        cert_regenerated = true;
                         push_issue(
                             &mut issues,
                             "ok",
@@ -1047,12 +1051,16 @@ fn run_proxy_preflight(
     // 提权失败再降级 CurrentUser\Root。
     let mut ca_status = crate::commands::cert_install::check_ca_status();
     if repair {
-        if matches!(
-            ca_status.effective_store,
-            crate::commands::cert_install::CaStore::None
-        ) && (ca_status.cert_exists || cert_ok)
+        // 证书刚被重生过（SAN 版本升级）时也必须重装：信任库里同 CN 的旧指纹已经验不了新链。
+        // prefer_fresh_install 会先清掉同 CN 下不匹配的旧指纹，避免同名多证书打架。
+        if (cert_regenerated
+            || matches!(
+                ca_status.effective_store,
+                crate::commands::cert_install::CaStore::None
+            ))
+            && (ca_status.cert_exists || cert_ok)
         {
-            match crate::commands::cert_install::install_ca_with_options(false, false) {
+            match crate::commands::cert_install::install_ca_with_options(false, cert_regenerated) {
                 Ok(msg) => {
                     ca_status = crate::commands::cert_install::check_ca_status();
                     if !matches!(

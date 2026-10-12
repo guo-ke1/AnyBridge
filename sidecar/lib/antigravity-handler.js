@@ -12,6 +12,7 @@
 // 4. 精准模型分流：
 //    自定义接入模型本地拦截并转换上游协议，官方模型透明走科学透传。
 
+import fs from 'node:fs';
 import https from 'node:https';
 import { httpsAgentFor } from '../system-proxy.js';
 
@@ -680,15 +681,19 @@ export async function forwardToOfficialAntigravity(req, res, { body, customPath,
  * 极其合规的 Mock 配额及服务能力（彻底移除毒丸项目字段，秒级返回，杜绝重试风暴）
  */
 export function mockAntigravityLoadCodeAssist() {
+  // 注意：UserTier 消息的合法 proto 字段是 id/name/isDefault/availableCredits 等，
+  // 没有 `tier` 枚举字段——多余字段会导致 proto3 严格解析丢弃整个消息（tier 变空）。
+  // id 必须使用 LS 认识的套餐名（free-tier 等），自造值会被当成无套餐，
+  // boost / teamwork 等套餐能力命令将被整体隐藏。
   return {
     currentTier: {
-      id: 'standard-tier',
-      name: 'Standard Tier',
-      isDefault: true,
+      id: 'free-tier',
+      name: 'Antigravity',
+      isDefault: false,
     },
     paidTier: {
-      id: 'paid-tier',
-      name: 'Paid Tier',
+      id: 'free-tier',
+      name: 'Antigravity',
       availableCredits: [
         {
           creditType: 'GOOGLE_ONE_AI',
@@ -702,6 +707,14 @@ export function mockAntigravityLoadCodeAssist() {
         id: 'free-tier',
         name: 'Free Tier',
         isDefault: true,
+      },
+      {
+        id: 'free-tier',
+        name: 'Antigravity',
+      },
+      {
+        id: 'g1-ultra-tier',
+        name: 'Antigravity',
       },
     ],
     cloudaicompanionProject: '',
@@ -742,6 +755,136 @@ export function mockAntigravityUserQuotaSummary() {
 }
 
 /**
+ * LS 侧 UserTier 的合法 proto 枚举（从 language_server 二进制提取）。
+ * tier 值若不在集合内，proto 解析会失败，客户端 SetUserTier 收到空串，
+ * boost / teamwork-preview 等套餐能力命令将被整体隐藏。
+ */
+const VALID_USER_TIERS = new Set([
+  'USER_TIER_UNSPECIFIED', 'AIDA_TIER', 'CS_STANDARD_TIER', 'AGY_BUSINESS_PAYGO_TIER',
+  'ENTERPRISE_AGENT_TIER', 'free-tier', 'free-tier', 'g1-ultra-tier', 'G1_ULTRA_LITE_TIER',
+  'G1_PLUS_TIER', 'GCP_ENTERPRISE_TIER', 'GCP_GE_PAYGO_TIER', 'GCP_GE_PLUS_TIER',
+  'GCP_GE_STANDARD_TIER', 'GCP_GE_STANDARD_EMERGING_TIER', 'GCP_GE_EDU_TIER',
+  'GCP_GE_EDU_PRO_TIER', 'GCP_GE_EDU_EMERGING_TIER', 'GCP_GE_EDU_PRO_EMERGING_TIER',
+  'GCP_GE_EDU_GOV_EMERGING_TIER',
+]);
+
+/**
+ * 校验并补齐响应中的用户套餐（仅在完全缺失时兜底）：
+ *
+ * 重要教训：官方响应的 tier 值形如 'free-tier'（小写 kebab），是 LS 认识的
+ * 唯一形式。此前用大写枚举名（free-tier）做"校验改写"，反而把官方合法值
+ * 改成了 LS 不认识的形式，破坏了官方完整数据，导致高级命令被隐藏。
+ * 因此这里绝不改写官方已有值，只在字段完全缺失时按官方同款形式兜底。
+ */
+export function ensureAntigravityTier(response) {
+  try {
+    if (!response || typeof response !== 'object') return response;
+    const fix = (obj, key) => {
+      const t = obj?.[key];
+      if (!t || typeof t !== 'object') return;
+      delete t.tier; // UserTier 消息没有该字段，留着会导致 proto3 严格解析丢弃整个消息
+      // 已有 id：原样保留，绝不改写
+    };
+    fix(response, 'currentTier');
+    fix(response, 'userTier');
+    return response;
+  } catch {
+    return response;
+  }
+}
+
+/**
+ * 捕获式官方请求（原始字节版）：返回 { statusCode, contentType, body } 或 null。
+ * 官方部分握手端点可能返回非 JSON（proto 等），调用方必须按 content-type 分流，
+ * 不能盲目 JSON.parse 后回落 mock——那会把官方完整结构替换成残缺的 mock 数据，
+ * 导致 LS 判定判定账号/能力不完整，boost / teamwork 等命令被隐藏。
+ *
+ * 多 host 采用竞速（最快成功者胜出）而非 Promise.all：等最慢 host 会把总时延
+ * 拖到 LS 客户端超时（表现为 LS 反复重试 loadCodeAssist），最终拿不到完整数据。
+ */
+export async function fetchOfficialAntigravityRaw(req, body, pathname) {
+  const url = new URL(req.url, 'http://localhost');
+  const payload = body === undefined || body === null
+    ? Buffer.from('{}', 'utf8')
+    : (Buffer.isBuffer(body) ? body : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body), 'utf8'));
+  const started = Date.now();
+  const ok = await raceOfficialSuccess(
+    OFFICIAL_ANTIGRAVITY_HOSTS.map(host =>
+      officialRequestOnce(host, req, payload, pathname, url.search, 6000)
+    ),
+  );
+  if (!ok) {
+    logHandshake(`${pathname} → 全部 host 失败/超时 (${Date.now() - started}ms)`);
+    return null;
+  }
+  const h = ok.headers || {};
+  const contentType = String(h['content-type'] || h['Content-Type'] || '');
+  logHandshake(`${pathname} → ${ok.statusCode} ${contentType} (${ok.body.length}B, ${Date.now() - started}ms)`, ok.body);
+  return { statusCode: ok.statusCode, contentType, body: ok.body };
+}
+
+function raceOfficialSuccess(promises) {
+  return new Promise((resolve) => {
+    let pending = promises.length;
+    let settled = false;
+    if (pending === 0) { resolve(null); return; }
+    for (const p of promises) {
+      p.then((r) => {
+        pending -= 1;
+        if (settled) return;
+        if (r && r.statusCode >= 200 && r.statusCode < 300 && r.body && r.body.length > 0) {
+          settled = true;
+          resolve(r);
+        } else if (pending === 0) {
+          resolve(null);
+        }
+      }).catch(() => {
+        pending -= 1;
+        if (!settled && pending === 0) resolve(null);
+      });
+    }
+  });
+}
+
+function logHandshake(line, body) {
+  try {
+    const dir = process.env.APPDATA ? `${process.env.APPDATA}/AnyBridge` : '.';
+    let entry = `${new Date().toISOString()} ${line}\n`;
+    if (body) {
+      // 仅截取响应头部用于诊断（完整响应可能达数十 KB 且周期性调用）
+      const text = body.toString('utf8').slice(0, 2000);
+      entry += text + (body.length > 2000 ? '\n…[截断]' : '') + '\n---\n';
+    }
+    fs.appendFileSync(`${dir}/ag-handshake.log`, entry);
+  } catch {}
+  console.error(`[antigravity] ${line}`);
+}
+
+/**
+ * 捕获式官方请求：返回解析后的 JSON（而不是直接 pipe 给客户端），
+ * 用于 hybrid 模式下需要后处理（tier 注入等）的握手类端点。
+ */
+export async function fetchOfficialAntigravityJson(req, body, pathname) {
+  const url = new URL(req.url, 'http://localhost');
+  const payload = body === undefined || body === null
+    ? Buffer.from('{}', 'utf8')
+    : (Buffer.isBuffer(body) ? body : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body), 'utf8'));
+  const results = await Promise.all(
+    OFFICIAL_ANTIGRAVITY_HOSTS.map(host =>
+      officialRequestOnce(host, req, payload, pathname, url.search, 15000)
+    )
+  );
+  const ok = results.find(r => r && r.statusCode >= 200 && r.statusCode < 300 && r.body);
+  if (!ok) return null;
+  try {
+    const parsed = JSON.parse(ok.body.toString('utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 合规的用户信息（消除 IDE 状态栏/面板的未登录与用户凭据警告）
  */
 export function mockAntigravityUserInfo() {
@@ -750,9 +893,9 @@ export function mockAntigravityUserInfo() {
     email: 'user@anybridge.local',
     profilePictureUrl: '',
     userTier: {
-      id: 'standard-tier',
-      name: 'Standard Tier',
-      isDefault: true,
+      id: 'free-tier',
+      name: 'Antigravity',
+      isDefault: false,
     },
     userSettings: {
       telemetryEnabled: false,
@@ -763,14 +906,45 @@ export function mockAntigravityUserInfo() {
 
 /**
  * 合规的管理控制权限（允许开启全部模型与 Agent 特性）
+ *
+ * 注意结构必须匹配 FetchAdminControlsResponse 的 proto 定义：
+ * featureControls.multiagentControls.boostCommandDisabled /
+ * teamworkPreviewCommandDisabled 控制斜杠命令面板里 boost 与 teamwork-preview
+ * 两个多智能体命令是否显示。之前的 adminControls.allFeaturesEnabled 结构
+ * 不存在于 proto 中，等于没提供任何有效控制。
  */
 export function mockAntigravityAdminControls() {
   return {
-    adminControls: {
-      allFeaturesEnabled: true,
-      allowedModels: [],
+    adminControlsApplicable: false,
+    featureControls: {
+      multiagentControls: {
+        boostCommandDisabled: false,
+        teamworkPreviewCommandDisabled: false,
+      },
     },
   };
+}
+
+/**
+ * hybrid 模式下对官方 fetchAdminControls 响应强制补齐多智能体命令开关：
+ * 官方可能未提供或显式禁用 multiagentControls，导致 boost / teamwork-preview
+ * 在斜杠命令面板消失。这里保持官方其余数据不变，把两个开关显式置为未禁用。
+ */
+export function ensureAntigravityAdminControls(response) {
+  try {
+    if (!response || typeof response !== 'object') return response;
+    if (!response.featureControls || typeof response.featureControls !== 'object') {
+      response.featureControls = {};
+    }
+    if (!response.featureControls.multiagentControls || typeof response.featureControls.multiagentControls !== 'object') {
+      response.featureControls.multiagentControls = {};
+    }
+    response.featureControls.multiagentControls.boostCommandDisabled = false;
+    response.featureControls.multiagentControls.teamworkPreviewCommandDisabled = false;
+    return response;
+  } catch {
+    return response;
+  }
 }
 
 /**
@@ -791,12 +965,14 @@ export function mockAntigravityUserSettings() {
  */
 export function isAntigravityBypassMetricsPath(pathname) {
   const p = String(pathname || '').toLowerCase();
+  // 注意：listExperiments 不在此列——它是实验开关（服务发现数据），
+  // boost / teamwork-preview 等 preview 斜杠命令的启用依赖其返回的真实配置。
+  // 放进 bypass 秒回空 {} 会导致这些命令在客户端斜杠面板整体消失。
   return p.includes('recordcodeassistmetrics')
     || p.includes('recordtrajectoryanalytics')
     || p.includes('recordclientevent')
     || p.includes('recordsmartchoicesfeedback')
     || p.includes('uploadperformanceprofile')
-    || p.includes('listexperiments')
     || p.includes('checkurlantivirus')
     || p.includes('checkurldenylist');
 }

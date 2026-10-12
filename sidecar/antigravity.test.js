@@ -85,7 +85,7 @@ test('Antigravity handler: model catalog injection with custom models', () => {
 
 test('Antigravity handler: quota & code assist mocks', () => {
   const codeAssist = mockAntigravityLoadCodeAssist();
-  assert.equal(codeAssist.currentTier?.id, 'standard-tier');
+  assert.equal(codeAssist.currentTier?.id, 'free-tier');
   assert.equal(codeAssist.cloudaicompanionProject, '');
   assert.ok(codeAssist.paidTier?.availableCredits?.[0]?.creditAmount > 0);
   assert.ok(codeAssist.allowedTiers?.some(tier => tier.id === 'free-tier'));
@@ -207,17 +207,19 @@ test('Antigravity handler: quota & code assist mocks', () => {
 
   const userInfo = mockAntigravityUserInfo();
   assert.equal(userInfo.email, 'user@anybridge.local');
-  assert.equal(userInfo.userTier?.id, 'standard-tier');
+  assert.equal(userInfo.userTier?.id, 'free-tier');
 
   const adminControls = mockAntigravityAdminControls();
-  assert.equal(adminControls.adminControls?.allFeaturesEnabled, true);
+  assert.equal(adminControls.featureControls?.multiagentControls?.boostCommandDisabled, false);
 
   const userSettings = mockAntigravityUserSettings();
   assert.equal(userSettings.userSettings?.telemetryEnabled, false);
 
   assert.equal(isAntigravityBypassMetricsPath('/v1internal:recordCodeAssistMetrics'), true);
   assert.equal(isAntigravityBypassMetricsPath('/v1internal:recordTrajectoryAnalytics'), true);
-  assert.equal(isAntigravityBypassMetricsPath('/v1internal:listExperiments'), true);
+  // listExperiments 是实验开关（boost / teamwork-preview 等preview命令依赖它），
+  // 必须透传官方，不能放进 bypass 秒回空 {}
+  assert.equal(isAntigravityBypassMetricsPath('/v1internal:listExperiments'), false);
   assert.equal(isAntigravityBypassMetricsPath('/v1internal:fetchAvailableModels'), false);
 });
 
@@ -280,7 +282,7 @@ test('Antigravity HTTP 端点模拟: fetchAvailableModels & loadCodeAssist', asy
     });
     assert.equal(assistRes.status, 200);
     const assistJson = await assistRes.json();
-    assert.equal(assistJson.currentTier?.id, 'standard-tier');
+    assert.equal(assistJson.currentTier?.id, 'free-tier');
     assert.equal(assistJson.cloudaicompanionProject, '');
 
     // 2. 测试 onboardUser 必须返回已完成的 Long-running Operation，禁止轮询 /v1internal/undefined
@@ -329,7 +331,7 @@ test('Antigravity HTTP 端点模拟: fetchAvailableModels & loadCodeAssist', asy
     assert.equal(userRes.status, 200);
     const userJson = await userRes.json();
     assert.equal(userJson.name, 'AnyBridge User');
-    assert.equal(userJson.userTier?.id, 'standard-tier');
+    assert.equal(userJson.userTier?.id, 'free-tier');
 
     // 6. 测试 fetchAdminControls
     const adminRes = await fetch(`http://127.0.0.1:${port}/v1internal:fetchAdminControls`, {
@@ -339,7 +341,7 @@ test('Antigravity HTTP 端点模拟: fetchAvailableModels & loadCodeAssist', asy
     });
     assert.equal(adminRes.status, 200);
     const adminJson = await adminRes.json();
-    assert.equal(adminJson.adminControls?.allFeaturesEnabled, true);
+    assert.equal(adminJson.featureControls?.multiagentControls?.boostCommandDisabled, false);
 
     // 7. 测试指标旁路拦截: recordCodeAssistMetrics (0ms 秒回 200 {})
     const metricRes = await fetch(`http://127.0.0.1:${port}/v1internal:recordCodeAssistMetrics`, {

@@ -53,6 +53,10 @@ import {
   mockAntigravityUserSettings,
   isAntigravityBypassMetricsPath,
   singleflight,
+  fetchOfficialAntigravityJson,
+  fetchOfficialAntigravityRaw,
+  ensureAntigravityTier,
+  ensureAntigravityAdminControls,
 } from './lib/antigravity-handler.js';
 
 const AGENT = new https.Agent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16 });
@@ -197,6 +201,28 @@ function sendJson(res, status, body, headers = {}) {
   const text = JSON.stringify(body);
   res.writeHead(status, cors({ 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text), ...headers }));
   res.end(text);
+}
+
+// hybrid 握手类端点的统一处理：官方响应优先，按 content-type 分流
+// （JSON → 注入增强后返回；非 JSON → 原样透传），官方不可达才回落 mock。
+async function handleHybridHandshake(res, req, body, pathname, ensureFn, mockFn) {
+  const raw = await fetchOfficialAntigravityRaw(req, body, pathname);
+  if (raw && raw.contentType && raw.contentType.toLowerCase().includes('json')) {
+    try {
+      const parsed = JSON.parse(raw.body.toString('utf8'));
+      if (parsed && typeof parsed === 'object') {
+        sendJson(res, 200, ensureFn(parsed));
+        return;
+      }
+    } catch {}
+  }
+  if (raw) {
+    // 官方可达但响应非 JSON（proto 等）：原样透传，绝不能让 mock 覆盖官方完整结构
+    res.writeHead(raw.statusCode, cors({ 'content-type': raw.contentType || 'application/octet-stream', 'content-length': raw.body.length }));
+    res.end(raw.body);
+    return;
+  }
+  sendJson(res, 200, mockFn());
 }
 
 function sendRaw(res, status, body, headers = {}) {
@@ -965,6 +991,10 @@ export const __localProxyTest = {
   normalizeToolParameters,
   antigravityErrorSnapshot,
   writeAntigravityStreamError,
+  upstreamErrorText,
+  readableErrorText,
+  failureMessage,
+  classifyFailures,
   createGeminiStreamFromOpenAIChat,
   sendGemini,
   sendGeminiStream,
@@ -1610,11 +1640,38 @@ function classifyFailures(failures = []) {
   return { status: 502, type: 'upstream_error' };
 }
 
+/** 上游错误响应体里能读给用户听的文本；空响应 / 拦截页 / 无可读字段一律返回空串。*/
+function upstreamErrorText(body) {
+  const text = String(body == null ? '' : body).trim();
+  if (!text) return '';
+  // WAF/网关拦截页（HTML/XML）原样透传只会变成一堆标签，交给聚合错误统一描述
+  if (text.startsWith('<')) return '';
+  try {
+    const json = JSON.parse(text);
+    const message = json?.error?.message || json?.error?.type || json?.message || json?.detail;
+    if (typeof message === 'string' && message.trim()) return message.trim();
+    if (typeof json?.error === 'string' && json.error.trim()) return json.error.trim();
+    return '';
+  } catch {
+    return text;
+  }
+}
+
+/** 把上游错误文案裁成能读的形式；HTML/XML 拦截页、"HTTP 403" 这类占位一律当没信息。*/
+function readableErrorText(value) {
+  const text = String(value == null ? '' : value).trim();
+  if (!text || text.startsWith('<')) return '';
+  if (/^HTTP \d{3}$/i.test(text)) return '';
+  return text;
+}
+
 function failureMessage(failure = {}) {
   if (typeof failure === 'string') return failure;
   const status = failure.statusCode ? `HTTP ${failure.statusCode}` : (failure.code || '失败');
-  const details = failure.message ? `: ${failure.message}` : '';
-  return `${failure.providerName || 'provider'}: ${status}${details}`;
+  const raw = readableErrorText(failure.message)
+    || (failure.body != null ? upstreamErrorText(failure.body) : '');
+  const detail = raw ? `：${raw}` : (failure.statusCode ? '（上游返回空响应）' : '');
+  return `${failure.providerName || 'provider'} ${status}${detail}`;
 }
 
 async function maybeVisionFallback(ctx, slot, providers, mapConfig) {
@@ -2047,7 +2104,11 @@ export async function execute(ctx) {
     }
   }
   const lastUpstreamResponse = [...failures].reverse().find(f => f.statusCode && typeof f.body === 'string');
-  if (lastUpstreamResponse && rawProviderErrors) {
+  // 「显示供应商原始错误」只在原始响应真的带信息时才透传：上游常见的「403 + 空 body」
+  // （中转站风控拦截 / 模型未开通 / 渠道被拉黑）原样透传后，下游只能收到
+  // "403 (empty response body)"，既不知道是哪个上游目标失败的，也看不到备用目标的结果。
+  const lastRawErrorText = lastUpstreamResponse ? upstreamErrorText(lastUpstreamResponse.body) : '';
+  if (lastUpstreamResponse && rawProviderErrors && lastRawErrorText) {
     const classification = classifyFailures([lastUpstreamResponse]);
     recordError({
       provider: 'local-proxy',
@@ -2067,7 +2128,13 @@ export async function execute(ctx) {
   }
 
   const classification = classifyFailures(failures);
-  const message = failures.length ? `AnyBridge 本地代理没有可用目标：${failures.map(failureMessage).join('；')}` : 'AnyBridge 本地代理没有可用目标。';
+  const emptyResponse403 = failures.some(f => f.statusCode === 403 && !upstreamErrorText(f.body));
+  const hint = emptyResponse403
+    ? '。上游返回的 403 不带可读错误信息，常见于中转站风控拦截了该渠道、或该模型未开通，建议换一个渠道或核对上游模型名'
+    : '';
+  const message = failures.length
+    ? `模型「${ctx.model}」的上游目标都失败了：${failures.map(failureMessage).join('；')}${hint}`
+    : `模型「${ctx.model}」没有可用的上游目标。`;
   recordError({ provider: 'local-proxy', message });
   throw new LocalProxyUpstreamError(message, classification);
 }
@@ -2663,10 +2730,8 @@ export async function handleLocalProxyRequest(req, res, body) {
       // hybrid 模式：尝试透传给 Google 官方（保留真实登录与官方配额），网络不可用时优雅回退本地 Mock
       if (method === 'loadCodeAssist') {
         if (isHybrid) {
-          await forwardToOfficialAntigravity(req, res, {
-            body,
-            onFailed: () => sendJson(res, 200, mockAntigravityLoadCodeAssist()),
-          });
+          // 官方响应可能 tier 为空（补齐）或非 JSON（原样透传），mock 仅作兜底
+          await handleHybridHandshake(res, req, body, '/v1internal:loadCodeAssist', ensureAntigravityTier, mockAntigravityLoadCodeAssist);
           return;
         }
         const payload = await singleflight('ag_load_code_assist', 10000, async () => {
@@ -2723,10 +2788,7 @@ export async function handleLocalProxyRequest(req, res, body) {
       }
       if (method === 'fetchUserInfo') {
         if (isHybrid) {
-          await forwardToOfficialAntigravity(req, res, {
-            body,
-            onFailed: () => sendJson(res, 200, mockAntigravityUserInfo()),
-          });
+          await handleHybridHandshake(res, req, body, '/v1internal:fetchUserInfo', ensureAntigravityTier, mockAntigravityUserInfo);
           return;
         }
         const payload = await singleflight('ag_user_info', 10000, async () => {
@@ -2737,10 +2799,7 @@ export async function handleLocalProxyRequest(req, res, body) {
       }
       if (method === 'fetchAdminControls') {
         if (isHybrid) {
-          await forwardToOfficialAntigravity(req, res, {
-            body,
-            onFailed: () => sendJson(res, 200, mockAntigravityAdminControls()),
-          });
+          await handleHybridHandshake(res, req, body, '/v1internal:fetchAdminControls', ensureAntigravityAdminControls, mockAntigravityAdminControls);
           return;
         }
         const payload = await singleflight('ag_admin_controls', 10000, async () => {
@@ -2908,7 +2967,22 @@ export async function handleLocalProxyRequest(req, res, body) {
         return;
       }
 
-      // 6. 其它所有未明确拦截的内部探测请求：安全返回 200 {}
+      // 6. 其它未明确拦截的内部请求：
+      // listExperiments / buildWithGooglePlugins / cascadeNuxes 等服务发现类端点
+      // 携带实验开关与插件信息（boost / teamwork-preview 等 preview 功能的启用
+      // 依赖 listExperiments），返回空 {} 会导致这些命令在斜杠面板消失。
+      // - hybrid：透传官方，保持与直连一致的服务发现结果
+      // - pure：保持 200 {} 秒回（无官方通道）
+      if (isHybrid) {
+        const raw = await fetchOfficialAntigravityRaw(req, body, p);
+        if (raw) {
+          res.writeHead(raw.statusCode, cors({ 'content-type': raw.contentType || 'application/json; charset=utf-8', 'content-length': raw.body.length }));
+          res.end(raw.body);
+        } else {
+          sendJson(res, 200, {});
+        }
+        return;
+      }
       sendJson(res, 200, {});
       return;
     }

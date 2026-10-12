@@ -1526,7 +1526,8 @@ async function testProvider(id) {
     || 'openai';
 
   const selected = typeof providerSelectedModels === 'function' ? providerSelectedModels(p) : (p.models || []);
-  const testModel = p.defaultModel || selected[0] || null;
+  // 空白默认模型不能当模型用，否则会发出空模型 ID 让上游只回一句 "Invalid model id: "
+  const testModel = String(p.defaultModel || '').trim() || selected[0] || null;
 
   try {
     const result = await invoke('test_connection', {
@@ -1591,7 +1592,7 @@ async function testProviderInEditor() {
   const apiKey = document.getElementById('pf-key').value.trim();
   const fmt = document.getElementById('pf-format').value;
   const apiPath = document.getElementById('pf-path').value || '';
-  const model = selectedModels[0] || null;
+  const model = String(selectedModels[0] || '').trim() || null;
   if (!baseUrl || !apiKey) {
     showProviderEditorTestToast('请先填写 API 地址和密钥', 'warn');
     addLog('warn', '请先填写 API 地址和密钥');

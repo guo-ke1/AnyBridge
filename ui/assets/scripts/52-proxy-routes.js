@@ -2,6 +2,7 @@
 // ═══════ LOCAL PROXY MODEL ROUTES ═══════
 globalThis.proxyRoutesStore = { version: 1, defaultModelId: '', routes: [] };
 globalThis.proxyRoutesStoreLoaded = false;
+globalThis.proxyRoutesLoadError = '';
 globalThis.proxyRouteEditingId = '';
 globalThis.proxyRouteDraftTargets = [];
 globalThis.proxyRouteSelectedIds = new Set();
@@ -295,29 +296,80 @@ function getProxyRouteDefaultModel(format = 'openai') {
   return models[0] || '';
 }
 
+async function loadProxyRoutesOnce() {
+  const store = await invoke('load_proxy_routes');
+  proxyRoutesStore = normalizeProxyRoutesStore(store);
+  globalThis.proxyRoutesStoreLoaded = true;
+  globalThis.proxyRoutesLoadError = '';
+  renderProxyRoutes();
+  if (typeof syncLocalProxyUi === 'function') syncLocalProxyUi();
+  if (typeof syncLocalProxyProvider === 'function') syncLocalProxyProvider();
+  if (typeof renderProviders === 'function') renderProviders();
+}
+
+// 配置文件损坏时自动修复，而不是弹错误框烦用户：
+// Rust 端会先把原文件隔离备份，再抢救出可用条目重写，这里重新加载一次即可恢复可用。
 async function loadProxyRoutes() {
   if (!invoke) return;
   try {
-    const store = await invoke('load_proxy_routes');
-    proxyRoutesStore = normalizeProxyRoutesStore(store);
-    globalThis.proxyRoutesStoreLoaded = true;
-    renderProxyRoutes();
-    if (typeof syncLocalProxyUi === 'function') syncLocalProxyUi();
-    if (typeof syncLocalProxyProvider === 'function') syncLocalProxyProvider();
-    if (typeof renderProviders === 'function') renderProviders();
+    await loadProxyRoutesOnce();
+    return;
   } catch (e) {
+    globalThis.proxyRoutesStoreLoaded = false;
+    globalThis.proxyRoutesLoadError = String(e || '未知原因');
     addLog('err', '加载本地代理模型列表失败: ' + e);
   }
+  try {
+    const report = await invoke('repair_proxy_routes');
+    addLog('warn', `本地代理模型列表配置已自动修复：${report?.message || ''}${report?.backupPath ? `（原文件已备份：${report.backupPath}）` : ''}`);
+    await loadProxyRoutesOnce();
+    showBottomToast('模型列表配置已自动修复，现在可以正常添加模型', 'warn');
+    return;
+  } catch (repairErr) {
+    globalThis.proxyRoutesStoreLoaded = false;
+    addLog('err', '自动修复本地代理模型列表配置失败: ' + repairErr);
+  }
+  // 自动修复也没成功（例如配置目录不可写）才显式报错
+  renderProxyRoutesLoadError();
+  showCustomAlert(`本地代理模型列表加载失败，且自动修复未成功，为避免覆盖已有配置已暂停保存。失败原因：${globalThis.proxyRoutesLoadError}`, '加载失败', 'error');
+}
+
+/** 列表未加载时补一次加载。只能在改动 proxyRoutesStore 之前调用，否则会覆盖掉刚建好的条目。*/
+async function ensureProxyRoutesLoaded() {
+  if (globalThis.proxyRoutesStoreLoaded) return true;
+  await loadProxyRoutes();
+  return globalThis.proxyRoutesStoreLoaded === true;
+}
+
+/** 加载失败时把失败原因画进列表，避免停在"正在加载模型列表..."骗人。*/
+function renderProxyRoutesLoadError() {
+  const body = document.getElementById('proxyRoutesTableBody');
+  if (!body) return;
+  const reason = String(globalThis.proxyRoutesLoadError || '未知原因');
+  const tableWrap = document.querySelector('.proxy-routes-table-wrap');
+  if (tableWrap) tableWrap.classList.add('is-empty');
+  body.innerHTML = `<tr class="proxy-routes-empty-row"><td colspan="7">
+    <div class="proxy-routes-empty-state">
+      <div class="proxy-routes-empty-title">模型列表加载失败</div>
+      <div class="proxy-routes-empty-subtitle">为避免覆盖已有配置，保存已暂停。点「重试加载」后再操作。</div>
+      <div style="margin-top:10px;font-size:11px;line-height:1.5;color:var(--text-muted);word-break:break-all;">${proxyRouteEsc(reason)}</div>
+      <button type="button" class="btn-primary proxy-routes-empty-action" data-action="loadProxyRoutes">重试加载</button>
+    </div>
+  </td></tr>`;
 }
 
 async function saveProxyRoutes(options = {}) {
-  if (!globalThis.proxyRoutesStoreLoaded) {
-    console.warn('[saveProxyRoutes] proxyRoutesStore 尚未加载完成，放弃保存以保护磁盘配置');
-    return false;
-  }
   if (!invoke) {
     const message = '当前环境缺少 Tauri invoke，无法保存本地代理模型列表';
     addLog('err', message);
+    showCustomAlert(message, '保存失败', 'error');
+    return false;
+  }
+  // 未加载成功时不写盘，并且明确报错（调用方已经改过内存数据，这里绝不能再重新加载覆盖它）。
+  if (!globalThis.proxyRoutesStoreLoaded) {
+    const reason = String(globalThis.proxyRoutesLoadError || '未知原因');
+    const message = `本地代理模型列表还没加载成功，为避免覆盖已有配置已放弃保存。请先点「模型列表」右上角的刷新（或下面的「重试加载」）后再操作。失败原因：${reason}`;
+    addLog('err', '保存本地代理模型列表失败: ' + reason);
     showCustomAlert(message, '保存失败', 'error');
     return false;
   }
@@ -654,6 +706,13 @@ function renderProxyRoutes() {
 }
 
 async function openProxyRouteEditor(routeId = '') {
+  // 打开弹窗前先确保列表已加载：没加载成功就改不了，早报错比让用户白选一轮强。
+  if (!(await ensureProxyRoutesLoaded())) {
+    proxyRouteEditingId = '';
+    const reason = String(globalThis.proxyRoutesLoadError || '未知原因');
+    showCustomAlert(`本地代理模型列表还没加载成功，暂时无法添加或编辑模型。请先点「模型列表」右上角的刷新重试。失败原因：${reason}`, '打开失败', 'error');
+    return;
+  }
   proxyRouteEditingId = String(routeId || '').trim();
   const route = proxyRouteEditingId
     ? proxyRoutesStore.routes.find(item => item.id === proxyRouteEditingId)
@@ -1364,14 +1423,15 @@ async function saveProxyRouteEditor() {
     rawProviderErrors: document.getElementById('proxyRouteRawProviderErrorsInput')?.checked !== false,
   };
   const previous = cloneProxyRoutesStore();
-  let added = 0, skipped = 0;
+  let added = 0;
+  const skipReasons = [];
   proxyRoutePickedModels.forEach((bucket, providerId) => {
     bucket.forEach(modelId => {
       const model = proxyRouteProviderModel(providerId, modelId);
-      if (!model) { skipped++; return; }
-      if (proxyRouteTargetAlreadyExists(providerId, modelId)) { skipped++; return; }
+      if (!model) { skipReasons.push(`${modelId}：供应商模型列表里查不到`); return; }
+      if (proxyRouteTargetAlreadyExists(providerId, modelId)) { skipReasons.push(`${modelId}：已在列表中`); return; }
       const idInfo = proxyRouteIdForNewModel(providerId, modelId);
-      if (!idInfo.id) { skipped++; return; }
+      if (!idInfo.id) { skipReasons.push(`${modelId}：模型 ID 与现有条目冲突，且自动改名后仍冲突`); return; }
       const route = normalizeProxyRoute({
         id: idInfo.id,
         displayName: idInfo.id,
@@ -1395,7 +1455,10 @@ async function saveProxyRouteEditor() {
   proxyRoutesStore.defaultModelId = '';
   if (!added) {
     closeProxyRouteEditor();
-    if (skipped) showBottomToast('所选模型均已在列表中', 'warn');
+    // 全选几十个模型时提示会很长，弹窗没有滚动条，截断点位避免确认按钮被顶出屏幕
+    const shown = skipReasons.slice(0, 5).join('；');
+    const rest = skipReasons.length > 5 ? `；……共 ${skipReasons.length} 个` : '';
+    showCustomAlert(`没有添加任何模型：${shown}${rest}`, '添加结果', 'warn');
     return;
   }
   const btn = document.getElementById('proxyRouteEditorConfirmBtn');
@@ -1413,7 +1476,7 @@ async function saveProxyRouteEditor() {
     return;
   }
   closeProxyRouteEditor();
-  showBottomToast(`已添加 ${added} 个模型${skipped ? `（跳过 ${skipped} 个重复）` : ''}`, 'success');
+  showBottomToast(`已添加 ${added} 个模型${skipReasons.length ? `（跳过 ${skipReasons.length} 个：${skipReasons[0]}）` : ''}`, 'success');
 }
 
 // ─── 批量重命名（模型 ID 命名规则）───

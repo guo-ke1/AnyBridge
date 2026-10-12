@@ -575,9 +575,8 @@ impl Platform {
         match self {
             Platform::Antigravity | Platform::AntigravityIde => {
                 let ports = super::config::configured_proxy_ports();
-                let port = ports.api_port;
                 let preview = serde_json::json!({
-                    "jetski.cloudCodeUrl": format!("http://127.0.0.1:{}", port),
+                    "jetski.cloudCodeUrl": format!("https://localhost:{}", ports.antigravity_https_port),
                     "// 说明": format!("已接管 {}，当前绑定模型：{}", self.display_name(), p.default_model)
                 });
                 serde_json::to_string_pretty(&preview).map_err(|e| e.to_string())
@@ -780,8 +779,9 @@ impl Platform {
 
     fn apply_antigravity_ide(&self, path: &PathBuf, _p: &Provider) -> Result<(), String> {
         let ports = super::config::configured_proxy_ports();
-        let port = ports.api_port;
-        let proxy_url = format!("http://127.0.0.1:{}", port);
+        // 必须使用 https://localhost：LS 对明文 HTTP 端点会隐藏 boost /
+        // teamwork-preview 等高级命令；证书为 AnyBridge Local CA 签发（SAN 含 localhost）
+        let proxy_url = format!("https://localhost:{}", ports.antigravity_https_port);
 
         let raw = if path.exists() {
             fs::read_to_string(path).unwrap_or_default()
@@ -799,8 +799,9 @@ impl Platform {
 
     fn apply_antigravity(&self, path: &PathBuf, _p: &Provider) -> Result<(), String> {
         let ports = super::config::configured_proxy_ports();
-        let port = ports.api_port;
-        let proxy_url = format!("http://127.0.0.1:{}", port);
+        // 必须使用 https://localhost：LS 对明文 HTTP 端点会隐藏 boost /
+        // teamwork-preview 等高级命令；证书为 AnyBridge Local CA 签发（SAN 含 localhost）
+        let proxy_url = format!("https://localhost:{}", ports.antigravity_https_port);
 
         // 1. 确保白色桌面端 app.asar 已经打上端点补丁（失败必须中断接入，
         //    否则 LS 会以未补丁状态启动、静默走官方端点，造成「假接入」）

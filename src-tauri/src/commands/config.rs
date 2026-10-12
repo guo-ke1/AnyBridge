@@ -9,11 +9,16 @@ const APP_CONFIG_DIR_NAME: &str = "anybridge";
 const LEGACY_CONFIG_DIR_NAME: &str = "ide-byok";
 pub(crate) const DEFAULT_PROXY_PORT: u16 = 7450;
 pub(crate) const DEFAULT_INFERENCE_PORT: u16 = 7451;
+/// Antigravity 专用 HTTPS 端点端口（与 sidecar hybrid-server.js 的
+/// ANTIGRAVITY_HTTPS_PORT 严格对齐）。LS 对明文 HTTP 端点会隐藏
+/// boost / teamwork-preview 等高级命令，必须以 https://localhost 接入。
+pub(crate) const DEFAULT_ANTIGRAVITY_HTTPS_PORT: u16 = 7452;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ConfiguredProxyPorts {
     pub api_port: u16,
     pub inference_port: u16,
+    pub antigravity_https_port: u16,
 }
 
 /// 平台配置根目录（与 sidecar lib/config-dir.js 的 appConfigDir 严格对齐）：
@@ -145,6 +150,11 @@ pub(crate) fn configured_proxy_ports() -> ConfiguredProxyPorts {
             &["INFERENCE_PORT", "LOCAL_INFERENCE_PORT"],
             DEFAULT_INFERENCE_PORT,
         ),
+        antigravity_https_port: std::env::var("ANTIGRAVITY_HTTPS_PORT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .filter(|&p| p >= 1)
+            .unwrap_or(DEFAULT_ANTIGRAVITY_HTTPS_PORT),
     }
 }
 
@@ -1865,6 +1875,42 @@ pub async fn test_vision(args: TestVisionArgs) -> Result<TestVisionResult, Strin
     })
 }
 
+/// 按 host + key 在 providers.json 里找到对应供应商，返回它自己配置的模型。
+/// 供「测试连接没指定模型」时使用，保证测的就是该供应商真实会用的模型。
+fn provider_model_for_probe(host: &str, api_key: &str) -> Option<String> {
+    let store = read_provider_store().ok()?;
+    let host_norm = host.trim_end_matches('/').to_ascii_lowercase();
+    let key_norm = api_key.trim();
+    for p in &store.providers {
+        if p.enabled == false {
+            continue;
+        }
+        let p_host = p.api_host.trim_end_matches('/').to_ascii_lowercase();
+        if !host_norm.is_empty() && !p_host.is_empty() && p_host != host_norm {
+            continue;
+        }
+        if !key_norm.is_empty() && !p.api_key.trim().is_empty() && p.api_key.trim() != key_norm {
+            continue;
+        }
+        let default = p.default_model.trim();
+        if !default.is_empty() {
+            return Some(default.to_string());
+        }
+        let first = p.models.iter().map(|m| m.trim()).find(|m| !m.is_empty())?;
+        return Some(first.to_string());
+    }
+    None
+}
+
+/// 响应体是否是标准 JSON 错误（业务拒绝），用于区分「上游业务错误」和「WAF 拦截」。
+fn is_json_api_error(body: &str) -> bool {
+    let text = body.trim();
+    if text.is_empty() || text.starts_with('<') {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(text).is_ok()
+}
+
 #[tauri::command]
 pub async fn test_connection(args: TestConnArgs) -> Result<TestConnResult, String> {
     let host = args.host.trim_end_matches('/');
@@ -1882,26 +1928,42 @@ pub async fn test_connection(args: TestConnArgs) -> Result<TestConnResult, Strin
     .map_err(|e| e.to_string())?;
 
     // ── Chat 连通性探测（发送极简消息验证实际调用能力与延迟）──
+    // 模型名策略（按顺序）：
+    //   1) 调用方明确给了且非空白 → 用它；
+    //   2) 没给 → 按 host + key 去 providers.json 找到该供应商，用它自己配置的模型；
+    //   3) 该供应商压根没有模型 → 直接报错，不发请求。
+    // 绝不硬编码 gpt-4o-mini / claude-3-haiku 这类"通用模型名"兜底：只卖国模的中转站
+    // 根本没有这些模型，会把一个正常的渠道测成 "Invalid model id: gpt-4o-mini"（假阴性）。
+    let requested_model = args
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
+
+    let test_model: String = match requested_model {
+        Some(model) => model,
+        None => match provider_model_for_probe(&host, &args.api_key) {
+            Some(model) => model,
+            None => {
+                return Err(
+                    "这个供应商还没有配置任何模型，请先在编辑弹窗里添加或拉取模型，再测试连接。"
+                        .to_string(),
+                )
+            }
+        },
+    };
+    let test_model = test_model.as_str();
+
     let chat_path = if fmt == "openai" {
         normalize_openai_api_path(&host, args.path.as_deref())
     } else if fmt == "gemini" {
-        let model = args.model.as_deref().unwrap_or("gemini-2.5-flash");
-        normalize_gemini_api_path(&host, args.path.as_deref(), model)
+        normalize_gemini_api_path(&host, args.path.as_deref(), test_model)
     } else {
         normalize_anthropic_api_path(args.path.as_deref())
     };
     let uses_openai_responses =
         fmt == "openai" && chat_path.to_ascii_lowercase().contains("/responses");
-
-    let test_model = args.model.as_deref().unwrap_or_else(|| {
-        if fmt == "gemini" {
-            "gemini-2.5-flash"
-        } else if fmt == "anthropic" {
-            "claude-3-haiku-20240307"
-        } else {
-            "gpt-4o-mini"
-        }
-    });
 
     let (chat_body, auth_header, auth_value) = if fmt == "gemini" {
         let body = serde_json::json!({
@@ -1955,6 +2017,12 @@ pub async fn test_connection(args: TestConnArgs) -> Result<TestConnResult, Strin
     };
 
     let chat_url = format!("{}{}", host, chat_path);
+    // 失败时把"用哪个模型、打到哪个地址"一起报出来，否则上游一句
+    // "Invalid model id: " 之类的话根本没法判断是模型名错了还是链路错了。
+    let test_hint = format!(
+        "（本次测试模型：{}；目标地址：{}；协议：{}）",
+        test_model, chat_url, fmt
+    );
 
     // 发送请求的闭包：根据 use_gzip 决定是否压缩
     let send_req = |body: Vec<u8>, use_gzip: bool| {
@@ -1981,14 +2049,29 @@ pub async fn test_connection(args: TestConnArgs) -> Result<TestConnResult, Strin
         Ok(r) if r.status().is_success() => false,
         Ok(r) => {
             let status = r.status().as_u16();
-            let _err_body = r.text().await.unwrap_or_default();
+            let err_body = r.text().await.unwrap_or_default();
 
             // 401 = 真正的认证失败
             if status == 401 {
-                return Err("认证失败 (HTTP 401)，请检查 API 密钥".to_string());
+                return Err(format!("认证失败 (HTTP 401)，请检查 API 密钥{}", test_hint));
             }
 
-            // 400/403/其他 → 尝试 gzip（可能是 WAF 拦截明文 body）
+            // 只有「像 WAF 拦明文 body」才值得用 gzip 重发：403/406 且响应不是标准 JSON 错误
+            // （空响应 / HTML 拦截页 / 纯文本）。
+            // 像 {"error":{"message":"Invalid model id"}} 这种明确的业务错误再试一次毫无意义：
+            // 既白花一次请求，还会把报错拼成 "HTTP 403 / Gzip HTTP 400" 这种天书。
+            let looks_like_waf_block =
+                (status == 403 || status == 406) && !is_json_api_error(&err_body);
+            if !looks_like_waf_block {
+                return Err(format!(
+                    "上游返回错误：HTTP {}：{}{}",
+                    status,
+                    redact(snippet(&err_body, 200), &args.api_key),
+                    test_hint
+                ));
+            }
+
+            // 疑似 WAF 拦截 → 尝试用 gzip 重发（探测该渠道是否必须压缩提交）
             use flate2::write::GzEncoder;
             use flate2::Compression;
             use std::io::Write;
@@ -2001,25 +2084,34 @@ pub async fn test_connection(args: TestConnArgs) -> Result<TestConnResult, Strin
                 Ok(r) => {
                     let gz_status = r.status().as_u16();
                     if gz_status == 401 || gz_status == 403 {
-                        return Err(format!("认证失败 (HTTP {})，请检查 API 密钥", gz_status));
+                        return Err(format!(
+                            "认证失败 (HTTP {})，请检查 API 密钥{}",
+                            gz_status, test_hint
+                        ));
                     }
                     let gz_body = r.text().await.unwrap_or_default();
                     let gz_snippet: String = gz_body.chars().take(200).collect();
                     return Err(format!(
-                        "HTTP {} / Gzip HTTP {}: {}",
-                        status, gz_status, gz_snippet
+                        "上游返回错误：明文 HTTP {}，Gzip 重发仍失败 HTTP {}：{}{}",
+                        status, gz_status, gz_snippet, test_hint
                     ));
                 }
                 Err(e) => {
                     return Err(format!(
-                        "明文 HTTP {}，Gzip 网络错误: {}",
+                        "明文 HTTP {}，Gzip 重发网络错误: {}{}",
                         status,
-                        redact(e.to_string(), &args.api_key)
+                        redact(e.to_string(), &args.api_key),
+                        test_hint
                     ));
                 }
             }
         }
-        Err(e) => return Err(redact(format!("网络错误: {}", e), &args.api_key)),
+        Err(e) => {
+            return Err(redact(
+                format!("网络错误: {}{}", e, test_hint),
+                &args.api_key,
+            ))
+        }
     };
 
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -2246,4 +2338,26 @@ pub async fn fetch_models(args: FetchModelsArgs) -> Result<FetchModelsResult, St
         models,
         api_format: fmt.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_api_errors_must_not_be_treated_as_waf_blocks() {
+        // 业务错误：上游明确拒绝了某个模型/参数 → 不该再用 gzip 重试一次
+        assert!(is_json_api_error(r#"{"error":{"message":"Invalid model id: "}}"#));
+        assert!(is_json_api_error(r#"{"error":{"message":"no such model"}}"#));
+        assert!(is_json_api_error(r#"{"message":"insufficient balance"}"#));
+    }
+
+    #[test]
+    fn empty_or_html_responses_look_like_waf_blocks() {
+        // 空响应 / HTML 拦截页 / 纯文本：才值得用 gzip 重发探测
+        assert!(!is_json_api_error(""));
+        assert!(!is_json_api_error("   "));
+        assert!(!is_json_api_error("<html><body><h1>403 Forbidden</h1></body></html>"));
+        assert!(!is_json_api_error("Forbidden"));
+    }
 }

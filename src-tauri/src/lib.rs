@@ -152,6 +152,7 @@ pub fn run() {
             commands::model_map::validate_model_map,
             commands::proxy_routes::load_proxy_routes,
             commands::proxy_routes::save_proxy_routes,
+            commands::proxy_routes::repair_proxy_routes,
             commands::proxy_routes::load_claude_desktop_bindings,
             commands::proxy_routes::save_claude_desktop_bindings,
             commands::claude_desktop::get_claude_desktop_status,

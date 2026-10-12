@@ -21,7 +21,52 @@ pub const LEGACY_CA_COMMON_NAMES: &[&str] = &[
     "AnyBridge Local MITM",
 ];
 
-const MITM_CERT_SAN_VERSION: &str = "2";
+/// 证书结构版本号。改动证书结构时必须 +1，否则存量机器上那张旧证书不会被重生（改了代码也不生效）。
+/// v2 → v3：修掉有效期。此前用 rcgen 默认（1975-01-01 ~ 4096-01-01，2121 年），
+/// 违反 Apple / Chromium「TLS 服务器证书有效期 ≤ 825 天」策略，新版客户端直接回
+/// TLS alert 42 (bad certificate)，MITM 断开、模型改写不生效。
+const MITM_CERT_SAN_VERSION: &str = "3";
+/// 证书有效期（相对当前时间的天数）。
+/// not_before 往前 1 天，容忍客户端与本机之间的时钟偏差；
+/// not_after 365 天，远低于 Apple / Chromium 要求的 825 天上限。
+const MITM_CERT_NOT_BEFORE_DAYS: i64 = -1;
+const MITM_CERT_NOT_AFTER_DAYS: i64 = 365;
+/// 证书文件超过这个天数就换新。必须明显小于 NOT_AFTER_DAYS，确保在过期前换掉。
+const MITM_CERT_MAX_AGE_DAYS: u64 = 300;
+
+/// rcgen 0.13 的 not_before / not_after 是 time::OffsetDateTime，
+/// 默认值是 1975-01-01 ~ 4096-01-01（2121 年）—— 现代客户端按「有效期超限」
+/// 直接判定证书不合规（TLS alert 42 bad certificate），必须显式设置。
+/// 证书是否需要换新：文件生成时间已超过换证阈值。
+/// 证书现在有 365 天有效期，过期后客户端会重新按策略拒绝（跟这次修的问题同一类），
+/// 所以用「文件生成时间」做免解析的到期判断：只要用户每 365 天启动过一次就不会拿到过期证书，
+/// 久未启动则下次启动自动换新。
+pub(crate) fn mitm_certs_need_renewal(certs_dir: &std::path::Path) -> bool {
+    let leaf = certs_dir.join(MITM_LEAF_CERT_FILE);
+    let modified = match leaf.metadata().and_then(|m| m.modified()) {
+        Ok(t) => t,
+        // 读不到时间说明文件缺失/异常，交给后面的完整性校验去重生
+        Err(_) => return false,
+    };
+    modified
+        .elapsed()
+        .map(|d| d.as_secs() >= MITM_CERT_MAX_AGE_DAYS * 24 * 3600)
+        // 系统时间早于文件时间（时钟异常）时不据此换新
+        .unwrap_or(false)
+}
+
+fn mitm_cert_validity() -> Result<(time::OffsetDateTime, time::OffsetDateTime), String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("系统时间异常，无法生成证书: {}", e))?
+        .as_secs() as i64;
+    let stamp = |days: i64| {
+        time::OffsetDateTime::from_unix_timestamp(now + days * 24 * 3600)
+            .map_err(|e| format!("证书有效期计算失败: {}", e))
+    };
+    Ok((stamp(MITM_CERT_NOT_BEFORE_DAYS)?, stamp(MITM_CERT_NOT_AFTER_DAYS)?))
+}
+
 const MITM_DNS_NAMES: &[&str] = &[
     "server.self-serve.windsurf.com",
     "server.codeium.com",
@@ -87,6 +132,7 @@ fn write_mitm_cert_bundle(certs_dir: &std::path::Path) -> Result<(), String> {
 
     let san_names: Vec<String> = mitm_dns_names().iter().map(|n| (*n).to_string()).collect();
     let san_entries = mitm_san_entries()?;
+    let (not_before, not_after) = mitm_cert_validity()?;
 
     // ── CA 信任根：装入系统证书库，客户端（含 rustls probe）以此为 root。
     // 标记 IsCa + keyCertSign；保留 SAN 以兼容既有 san-version 校验逻辑。
@@ -94,6 +140,10 @@ fn write_mitm_cert_bundle(certs_dir: &std::path::Path) -> Result<(), String> {
     let mut ca_dn = DistinguishedName::new();
     ca_dn.push(DnType::CommonName, CA_COMMON_NAME);
     ca_params.distinguished_name = ca_dn;
+    ca_params.not_before = not_before;
+    ca_params.not_after = not_after;
+    // 带上 SKI/AKI：严格校验（含 openssl -x509_strict）要求链条可定位签发者
+    ca_params.use_authority_key_identifier_extension = true;
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![
         KeyUsagePurpose::DigitalSignature,
@@ -111,6 +161,9 @@ fn write_mitm_cert_bundle(certs_dir: &std::path::Path) -> Result<(), String> {
     let mut leaf_dn = DistinguishedName::new();
     leaf_dn.push(DnType::CommonName, "AnyBridge MITM Leaf");
     leaf_params.distinguished_name = leaf_dn;
+    leaf_params.not_before = not_before;
+    leaf_params.not_after = not_after;
+    leaf_params.use_authority_key_identifier_extension = true;
     leaf_params.is_ca = IsCa::NoCa;
     leaf_params.key_usages = vec![
         KeyUsagePurpose::DigitalSignature,
@@ -683,9 +736,13 @@ pub fn ensure_mitm_certs_ex(force: bool) -> Result<(std::path::PathBuf, bool), S
         .map(|s| s.trim() == MITM_CERT_SAN_VERSION)
         .unwrap_or(false);
     let contents_ok = cert_ok && key_ok && validate_mitm_cert_files(&cert_path, &key_path).is_ok();
-    // CA 与叶子证书必须成对且完整；任一空/缺/版本过期/内容无效都重生。
+    // 证书现在有有效期（365 天），到期后客户端会重新按策略拒绝 → 必须提前换新。
+    // 用「文件生成时间」判断是否该换（阈值 300 天 < 365 天有效期），无需额外 X.509 解析依赖：
+    // 只要用户每 365 天启动过一次，就不会拿到过期证书；久未启动则下次启动自动换新。
+    let fresh_enough = !mitm_certs_need_renewal(&certs_dir);
+    // CA 与叶子证书必须成对且完整；任一空/缺/版本过期/内容无效/快到期都重生。
     // 旧版只有 CA-as-leaf 单文件（无 mitm-leaf.pem）→ leaf_ok=false → 自动补齐叶子证书。
-    let already_complete = !force && contents_ok && san_ok && leaf_ok;
+    let already_complete = !force && contents_ok && san_ok && leaf_ok && fresh_enough;
 
     if !already_complete {
         // 生成 CA 信任根 + 由其签发的 end-entity 叶子证书。
@@ -2150,6 +2207,30 @@ mod tests {
                 expected
             );
         }
-        assert_eq!(MITM_CERT_SAN_VERSION, "2");
+        assert_eq!(MITM_CERT_SAN_VERSION, "3");
+    }
+
+    #[test]
+    fn freshly_generated_certs_do_not_need_renewal() {
+        let dir = std::env::temp_dir().join("anybridge-cert-renewal-check");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_mitm_cert_bundle_for_test(&dir).unwrap();
+        assert!(
+            !mitm_certs_need_renewal(&dir),
+            "刚生成的证书不能被判定为需要换新，否则每次启动都会重装信任库"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mitm_cert_validity_stays_within_the_825_day_client_limit() {
+        // Apple / Chromium 硬性要求 TLS 服务器证书有效期 ≤ 825 天，超了会被判
+        // bad certificate（TLS alert 42）。rcgen 默认给的是 1975→4096（2121 年）。
+        let validity_days = (MITM_CERT_NOT_AFTER_DAYS - MITM_CERT_NOT_BEFORE_DAYS) as i64;
+        assert!(
+            validity_days > 0 && validity_days <= 825,
+            "证书有效期必须在 825 天以内，当前 {validity_days} 天",
+        );
     }
 }

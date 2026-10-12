@@ -158,6 +158,24 @@ try {
 
 let requestCounter = 0;
 
+// 客户端在 TLS 握手阶段拒掉我们证书的判定。
+// 典型报文：`ssl/tls alert bad certificate ... SSL alert number 42`、
+// `unknown ca`、`certificate verify failed`。
+// 出现这类错误时 MITM 直接断，模型改写不会执行（表现为"还是原模型"），必须让人能自查。
+const CA_COMMON_NAME_HINT = '「AnyBridge Local CA」';
+function mitmCertRejected(err) {
+  const text = String((err && (err.message || err.code)) || '').toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes('bad certificate')
+    || text.includes('unknown ca')
+    || text.includes('certificate verify failed')
+    || text.includes('unable to verify')
+    || text.includes('self signed certificate in certificate chain')
+    || text.includes('alert number 42')
+  );
+}
+
 // MITM 连接的上游主机映射：记录每个 TLS socket 对应的原始 CONNECT 目标。
 // Devin 连 server.codeium.com，Windsurf 连 server.self-serve.windsurf.com，
 // 代理需要转发到各自的真实上游，不能一律发到 windsurf.com。
@@ -1226,6 +1244,15 @@ server.on('connect', (req, clientSocket, head) => {
       // Ignore ECONNRESET / EPIPE — client disconnected
       if (err.code === 'ECONNRESET' || err.code === 'EPIPE') return;
       console.error(`  [#${id}] MITM TLS error: ${err.message}`);
+      // 客户端不认我们的证书时，光甩一行 OpenSSL 内部错误没人看得懂，
+      // 直接把排查动作写清楚（这种失败会导致模型改写不生效，表现为"还是原模型"）。
+      if (mitmCertRejected(err)) {
+        console.error(
+          `  [#${id}] ❗ 客户端拒绝了 MITM 证书 → 请到「平台(智能体) > 设置 > 环境检测」点「清理并重装」，` +
+          '并在系统弹窗里允许授权；然后完全退出 IDE 再打开。若仍失败，检查系统钥匙串/证书库里 ' +
+          `${CA_COMMON_NAME_HINT} 是否为「始终信任」。`
+        );
+      }
       if (!clientSocket.destroyed) clientSocket.destroy();
     });
 
@@ -1296,3 +1323,31 @@ function logBanner() {
 }
 
 listenWithReclaim(server, PORT, logBanner, 'hybrid');
+
+// ─── Antigravity HTTPS 端点 ───
+// Antigravity 的语言服务器对明文 HTTP 端点会隐藏 boost / teamwork-preview 等
+// 高级命令（官方直连是 https）。这里用已受系统信任的 AnyBridge Local CA 签发的
+// 叶子证书（SAN 含 localhost）提供 https 端点，使接管后 LS 仍以 https 方式接入。
+function startAntigravityHttpsEndpoint() {
+  const base = process.env.APPDATA ? path.join(process.env.APPDATA, 'AnyBridge', 'certs') : '';
+  const keyPath = base ? path.join(base, 'mitm-leaf-key.pem') : '';
+  const certPath = base ? path.join(base, 'mitm-leaf.pem') : '';
+  try {
+    if (!base || !fs.existsSync(keyPath) || !fs.existsSync(certPath)) {
+      console.error('[antigravity-https] 证书缺失，跳过 HTTPS 端点');
+      return;
+    }
+    const httpsServer = https.createServer(
+      { key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) },
+      handleRequest,
+    );
+    const httpsPort = intEnv('ANTIGRAVITY_HTTPS_PORT', 7452, 1);
+    httpsServer.on('error', err => console.error(`[antigravity-https] 监听 ${httpsPort} 失败: ${err.message}`));
+    httpsServer.listen(httpsPort, '127.0.0.1', () => {
+      console.error(`[antigravity-https] 已就绪: https://localhost:${httpsPort}`);
+    });
+  } catch (e) {
+    console.error(`[antigravity-https] 启动异常: ${e.message}`);
+  }
+}
+startAntigravityHttpsEndpoint();

@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::config::config_dir_path;
 
@@ -423,6 +424,126 @@ pub fn save_proxy_routes(mut store: ProxyRoutes) -> Result<(), String> {
     normalize_routes(&mut store);
     validate_routes(&store)?;
     write_routes(&store)
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyRoutesRepairReport {
+    /// 隔离备份出来的原文件路径（原本就没有文件时为空）
+    pub backup_path: String,
+    /// 抢救下来并保留的模型条数
+    pub kept: usize,
+    /// 被丢弃或停用的模型条数
+    pub fixed: usize,
+    /// 修复方式说明，直接展示给用户
+    pub message: String,
+}
+
+/// 抢救：去重、丢掉没有 ID 的条目、把没有上游目标的条目停用（而不是删除，保留用户配置），
+/// 并清掉非法的接口格式/解锁组合，保证结果一定能过 validate_routes。
+fn salvage_routes(routes: &mut ProxyRoutes) -> (usize, usize) {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut kept = 0usize;
+    let mut fixed = 0usize;
+    let mut out = Vec::with_capacity(routes.routes.len());
+    for mut route in std::mem::take(&mut routes.routes) {
+        let id = route.id.trim().to_string();
+        if id.is_empty() || !seen.insert(id.clone()) {
+            fixed += 1;
+            continue;
+        }
+        // 历史 uid 可能重复，清空后由 normalize_routes 按 id+目标重新生成
+        route.uid.clear();
+        for target in &mut route.targets {
+            if !matches!(
+                target.api_format.as_str(),
+                "" | "openai" | "anthropic" | "gemini"
+            ) {
+                target.api_format.clear();
+                fixed += 1;
+            }
+            if !matches!(target.unlock.as_str(), "" | "codex" | "claudeCode") {
+                target.unlock.clear();
+                fixed += 1;
+            }
+            if target.unlock == "codex" && target.api_format == "anthropic" {
+                target.api_format.clear();
+                fixed += 1;
+            }
+            if target.unlock == "claudeCode" && target.api_format == "openai" {
+                target.api_format.clear();
+                fixed += 1;
+            }
+        }
+        route
+            .targets
+            .retain(|t| !t.provider_id.trim().is_empty() && !t.model.trim().is_empty());
+        if route.enabled && route.targets.is_empty() {
+            route.enabled = false;
+            fixed += 1;
+        }
+        if route
+            .exposed_formats
+            .iter()
+            .any(|f| !matches!(f.as_str(), "openai" | "anthropic" | "gemini"))
+        {
+            route
+                .exposed_formats
+                .retain(|f| matches!(f.as_str(), "openai" | "anthropic" | "gemini"));
+            fixed += 1;
+        }
+        out.push(route);
+        kept += 1;
+    }
+    routes.routes = out;
+    (kept, fixed)
+}
+
+/// 自我修复：路由文件损坏或校验不过时，先把原文件隔离备份（绝不丢用户原始数据），
+/// 再尽量抢救出可用条目重写。用于把"加载失败 → 保存被拦"自动解开，而不是弹错误框烦用户。
+#[tauri::command]
+pub fn repair_proxy_routes() -> Result<ProxyRoutesRepairReport, String> {
+    let path = proxy_routes_path();
+    let mut report = ProxyRoutesRepairReport::default();
+
+    if !path.exists() {
+        write_routes(&empty_routes())?;
+        report.message = "配置文件不存在，已重建空列表".to_string();
+        return Ok(report);
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let backup = PathBuf::from(format!("{}.corrupt.{}", path.to_string_lossy(), now));
+    fs::copy(&path, &backup).map_err(|e| format!("备份损坏的代理路由配置失败: {}", e))?;
+    report.backup_path = backup.to_string_lossy().to_string();
+
+    let parsed = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<ProxyRoutes>(&raw).ok());
+
+    let mut routes = match parsed {
+        Some(routes) => routes,
+        None => {
+            write_routes(&empty_routes())?;
+            report.message = "原配置文件无法解析，已重建为空列表".to_string();
+            return Ok(report);
+        }
+    };
+
+    let (kept, fixed) = salvage_routes(&mut routes);
+    report.kept = kept;
+    report.fixed = fixed;
+    if routes.version == 0 {
+        routes.version = default_version();
+    }
+    normalize_routes(&mut routes);
+    validate_routes(&routes).map_err(|e| format!("修复后的配置仍不合法: {}", e))?;
+    write_routes(&routes)?;
+    report.message = format!("已恢复 {} 个模型，停用或丢弃 {} 个无效条目", kept, fixed);
+    Ok(report)
 }
 
 #[tauri::command]
