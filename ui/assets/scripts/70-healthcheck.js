@@ -222,6 +222,39 @@
   };
 
   // ──────────────────────────────────────────────
+  // 入口：用户点「重启 IDE」按钮
+  //
+  // 之前只有 Cursor 平台页有重启按钮，Windsurf/Devin 用户一旦在接入弹窗点了「稍后」，
+  // 界面上就再也没有任何补救入口 —— IDE 不重启，代理写入的配置永远不生效。
+  // 这里在环境检测面板统一提供，覆盖所有平台。
+  // ──────────────────────────────────────────────
+  window.restartIdeFromHealth = async function () {
+    if (!invoke) {
+      try { if (typeof bindTauriBridge === 'function') bindTauriBridge(); } catch (_) {}
+      if (!invoke) {
+        addLog && addLog('err', '重启 IDE 失败: Tauri 通道未就绪');
+        return;
+      }
+    }
+    const target = typeof resolveIdeProxyTarget === 'function'
+      ? await resolveIdeProxyTarget(false)
+      : (typeof getTargetIde === 'function' ? getTargetIde() : 'windsurf');
+    const label = typeof ideDisplayLabel === 'function' ? ideDisplayLabel(target) : String(target);
+    const btn = _hEl('health-restart-ide-btn');
+    if (btn) { btn.disabled = true; btn.dataset.oldText = btn.textContent; btn.textContent = '重启中...'; }
+    try {
+      const ok = await restartIdeNow(target);
+      if (ok) {
+        addLog && addLog('ok', `${label} 已重启；请打开一次模型选择器，再点「一键检测」确认接管已生效`);
+      }
+    } catch (e) {
+      addLog && addLog('err', `重启 ${label} 失败: ` + e);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = btn.dataset.oldText || '重启 IDE'; }
+    }
+  };
+
+  // ──────────────────────────────────────────────
   // 入口：用户点「清理老证书」按钮
   // ──────────────────────────────────────────────
   window.cleanupLegacyCaFromHealth = async function () {

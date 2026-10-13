@@ -202,6 +202,7 @@ pub fn run() {
             commands::proxy::restore_ide_direct,
             commands::proxy::stop_proxy,
             commands::proxy::get_proxy_status,
+            commands::proxy::get_takeover_state,
             commands::proxy::get_stats,
             commands::cursor_core::cursor_get_status,
             commands::cursor_core::cursor_preflight,

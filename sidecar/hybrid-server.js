@@ -15,7 +15,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { configDir } from './lib/config-dir.js';
 import { EventEmitter } from 'node:events';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { listenWithReclaim } from './port-utils.js';
 import { handleGetChatMessage, shouldIntercept } from './handlers/chat.js';
 import { handleLocalProxyRequest, isLocalProxyRequest } from './local-proxy.js';
@@ -91,6 +91,53 @@ function resolveCertsDir() {
   return toUrl(process.cwd());
 }
 const CERTS_DIR = resolveCertsDir();
+
+// ─── 接管心跳 ───
+// 「IDE 接管是否生效」的唯一可靠判据：代理有没有收到目标 IDE 的模型请求。
+// 配置写进 settings.json（patched）不等于生效——IDE 只在启动时读取代理配置，
+// 写完不重启就一直直连，模型下拉框永远不会被改写。
+// 这里把心跳落盘，供 Rust 侧体检直接判决，不再靠用户描述现象。
+const TAKEOVER_STATE_FILE = 'anybridge-takeover-state.json';
+const takeoverState = {
+  version: 1,
+  proxyStartedAt: Date.now(),
+  lastIdeRequestAt: 0,
+  lastCaptureAt: 0,
+  captureSource: '',
+  captureHost: '',
+};
+let takeoverPersistAt = 0;
+
+function takeoverStatePath() {
+  return path.join(configDir(), TAKEOVER_STATE_FILE);
+}
+
+function persistTakeoverState(force = false) {
+  const now = Date.now();
+  // IDE 心跳是秒级的，落盘节流到 5s，避免磁盘 IO 被打满
+  if (!force && now - takeoverPersistAt < 5000) return;
+  takeoverPersistAt = now;
+  try {
+    fs.writeFile(takeoverStatePath(), JSON.stringify(takeoverState, null, 2), () => {});
+  } catch { /* 心跳落盘失败不影响代理功能 */ }
+}
+
+function noteTakeoverRequest(host) {
+  takeoverState.lastIdeRequestAt = Date.now();
+  if (host) takeoverState.captureHost = String(host);
+  persistTakeoverState();
+}
+
+function noteTakeoverCapture(host) {
+  takeoverState.lastCaptureAt = Date.now();
+  takeoverState.captureSource = 'captured';
+  if (host) takeoverState.captureHost = String(host);
+  persistTakeoverState(true);
+}
+
+// 启动即落一次初始状态：让体检能区分「代理在跑但从没收到请求」与「代理没跑」
+persistTakeoverState(true);
+
 let MITM_CERT, MITM_KEY;
 let MITM_CA_CERT = null;
 let MITM_ENABLED = false;
@@ -539,6 +586,8 @@ function proxyToCodeium(req, res, body, id, opts = {}) {
         const shouldRewriteModels = proxyRes.statusCode === 200
           && (method === 'GetUserStatus' || method === 'GetCliModelConfigs');
         if (shouldRewriteModels) {
+          // 接管心跳：这一条请求证明 IDE 的流量确实经过了代理
+          noteTakeoverRequest(upstream);
           // 抓取原始模型清单(改名前)→ 缓存供 GUI 添加映射时选用（仅 GetUserStatus，清单最全）。
           // 性能优化：每秒 8-10 次心跳 → 节流到 30s 一次 + 签名比对
           // 注意：unlockModels 仍然每次都做（必须做，下拉框要看到 BYOK 项）
@@ -554,6 +603,7 @@ function proxyToCodeium(req, res, body, id, opts = {}) {
                   if (sig !== lastModelListSig) {
                     lastModelListSig = sig;
                     writeCapturedModelList(file, list);
+                    noteTakeoverCapture(upstream);
                     console.log(`  [#${id}] 📋 captured ${list.length} Windsurf models → ide-models.json`);
                   }
                 }
@@ -1329,11 +1379,13 @@ listenWithReclaim(server, PORT, logBanner, 'hybrid');
 // 高级命令（官方直连是 https）。这里用已受系统信任的 AnyBridge Local CA 签发的
 // 叶子证书（SAN 含 localhost）提供 https 端点，使接管后 LS 仍以 https 方式接入。
 function startAntigravityHttpsEndpoint() {
-  const base = process.env.APPDATA ? path.join(process.env.APPDATA, 'AnyBridge', 'certs') : '';
-  const keyPath = base ? path.join(base, 'mitm-leaf-key.pem') : '';
-  const certPath = base ? path.join(base, 'mitm-leaf.pem') : '';
+  // 证书目录必须走 CERTS_DIR 的跨平台解析（BYOK_CONFIG_DIR/certs → 资源目录/certs → ../certs）。
+  // 旧实现硬编码 Windows 的 process.env.APPDATA：macOS/Linux 上该变量不存在，
+  // 会在证书明明存在的情况下误报「证书缺失」并永久跳过 HTTPS 端点。
+  const keyPath = fileURLToPath(new URL('mitm-leaf-key.pem', CERTS_DIR));
+  const certPath = fileURLToPath(new URL('mitm-leaf.pem', CERTS_DIR));
   try {
-    if (!base || !fs.existsSync(keyPath) || !fs.existsSync(certPath)) {
+    if (!fs.existsSync(keyPath) || !fs.existsSync(certPath)) {
       console.error('[antigravity-https] 证书缺失，跳过 HTTPS 端点');
       return;
     }

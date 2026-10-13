@@ -224,6 +224,8 @@ fn issue_group_id(code: &str) -> &'static str {
     // 注意顺序：先匹配更具体的前缀，最后兜底到 "other"
     if code.starts_with("cert.") || code.starts_with("certs.") {
         "cert"
+    } else if code.starts_with("takeover.") {
+        "takeover"
     } else if code.starts_with("port.") || code == "proxy.health" {
         "port"
     } else if code.starts_with("sidecar.") {
@@ -250,6 +252,7 @@ fn group_meta(id: &str) -> (&'static str, &'static str) {
     match id {
         "path" => ("路径", "📁"),
         "cert" => ("证书", "🔒"),
+        "takeover" => ("接管状态", "🔗"),
         "port" => ("端口", "🔌"),
         "sidecar" => ("Sidecar", "⚙️"),
         "resources" => ("资源", "📦"),
@@ -264,6 +267,7 @@ pub fn group_report(report: &ProxyPreflightReport) -> GroupedHealthReport {
     let group_order = [
         "path",
         "cert",
+        "takeover",
         "port",
         "sidecar",
         "resources",
@@ -698,10 +702,10 @@ fn ensure_proxy_mitm_ready_once(force_regenerate: bool) -> Result<String, String
         ));
     }
     Ok(format!(
-        "证书目录={}；Thumbprint={}；信任库={:?}",
+        "证书目录={}；Thumbprint={}；信任库={}",
         certs_dir.to_string_lossy(),
         status.thumbprint.as_deref().unwrap_or("unknown"),
-        status.effective_store
+        crate::commands::cert_install::store_label(status.effective_store)
     ))
 }
 
@@ -867,6 +871,51 @@ fn resolve_plugins_dir(resource_dir: Option<&Path>) -> Option<PathBuf> {
         return Some(packaged);
     }
     None
+}
+
+/// 接管心跳状态文件（sidecar 写、Rust 只读）。
+///
+/// 「IDE 接管是否真的生效」的唯一可靠判据 = 代理最近有没有收到目标 IDE 的模型请求。
+/// 配置是否已写入（patched）**不代表生效**：IDE 只在启动时读取代理配置，
+/// 写入后不重启就一直走直连，模型下拉框永远不会被改写。
+const TAKEOVER_STATE_FILE: &str = "anybridge-takeover-state.json";
+
+/// 心跳新鲜窗口：IDE 打开后会持续发 GetUserStatus 心跳（秒级），
+/// 超过这个时间没收到请求即可判定「流量没进代理」。
+const TAKEOVER_FRESH_WINDOW_MS: u64 = 10 * 60 * 1000;
+
+/// 代理刚启动的观察窗口：此时还没收到请求属正常，避免刚启动就误报。
+const TAKEOVER_WARMUP_MS: u64 = 90 * 1000;
+
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TakeoverState {
+    #[serde(default)]
+    pub proxy_started_at: Option<u64>,
+    #[serde(default)]
+    pub last_ide_request_at: Option<u64>,
+    #[serde(default)]
+    pub last_capture_at: Option<u64>,
+    #[serde(default)]
+    pub capture_source: Option<String>,
+    #[serde(default)]
+    pub capture_host: Option<String>,
+}
+
+pub(crate) fn read_takeover_state(config_dir: &Path) -> Result<Option<TakeoverState>, String> {
+    let path = config_dir.join(TAKEOVER_STATE_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取接管状态失败: {}", e))?;
+    let parsed = serde_json::from_str::<TakeoverState>(&raw)
+        .map_err(|e| format!("解析 {} 失败: {}", TAKEOVER_STATE_FILE, e))?;
+    Ok(Some(parsed))
+}
+
+#[tauri::command]
+pub fn get_takeover_state() -> Result<Option<TakeoverState>, String> {
+    read_takeover_state(&crate::commands::config::config_dir_path())
 }
 
 fn run_proxy_preflight(
@@ -1135,7 +1184,8 @@ fn run_proxy_preflight(
                 "ok",
                 "cert.trust_current_user",
                 format!(
-                    "当前 CA 证书已装到 CurrentUser\\Root（无需管理员权限）。{}",
+                    "当前 CA 证书已装到 {}（无需管理员权限）。{}",
+                    crate::commands::cert_install::current_user_store_label(),
                     ca_status
                         .thumbprint
                         .as_deref()
@@ -1150,7 +1200,8 @@ fn run_proxy_preflight(
                 "ok",
                 "cert.trust_local_machine",
                 format!(
-                    "当前 CA 证书已装到 LocalMachine\\Root（系统级）。{}",
+                    "当前 CA 证书已装到 {}（系统级）。{}",
+                    crate::commands::cert_install::local_machine_store_label(),
                     ca_status
                         .thumbprint
                         .as_deref()
@@ -1166,7 +1217,10 @@ fn run_proxy_preflight(
                     &mut issues,
                     "err",
                     "cert.not_trusted",
-                    "当前 CA 证书已生成但未安装到系统根证书库。点「安装证书」可装到 CurrentUser\\Root（无需管理员），失败才弹 UAC；若仍异常请点「清理并重装」".to_string(),
+                    format!(
+                        "当前 CA 证书已生成但未安装到系统根证书库。点「安装证书」可装到 {}（无需管理员），失败才弹 UAC；若仍异常请点「清理并重装」",
+                        crate::commands::cert_install::current_user_store_label()
+                    ),
                 );
             }
             // cert_exists=false 已经在上面 certs.missing 提示过了
@@ -1649,7 +1703,7 @@ fn run_proxy_preflight(
                     &mut issues,
                     "warn",
                     "ide_models.empty_cache",
-                    "ide-models.json 里没有模型条目，无法判断映射槽位是否会出现在 IDE 下拉框",
+                    "缓存的 IDE 模型清单为空，无法判断映射槽位是否会出现在 IDE 下拉框。请启动代理后重启 IDE 并打开一次模型选择器",
                 );
             } else {
                 if source != "captured" {
@@ -1658,7 +1712,7 @@ fn run_proxy_preflight(
                         "warn",
                         "ide_models.not_proxy_captured",
                         format!(
-                            "ide-models.json 来源为 {}，不一定等于 IDE 实际下拉框；如模型不可见，请启动代理后重启 IDE 并打开一次模型选择器",
+                            "缓存的 IDE 模型清单来源为 {}（非代理实时抓取），不一定等于 IDE 实际下拉框；如模型不可见，请启动代理后重启 IDE 并打开一次模型选择器",
                             source
                         ),
                     );
@@ -1720,6 +1774,94 @@ fn run_proxy_preflight(
             "尚未抓取 IDE 模型清单；首次启动后请重启 IDE 并打开模型选择器，代理会记录真实可见模型",
         ),
         Err(e) => push_issue(&mut issues, "warn", "ide_models.cache_read_failed", e),
+    }
+
+    // ─── 接管心跳：IDE 的流量到底有没有进代理 ───
+    // 判据不是「配置写了没」而是「代理有没有收到该 IDE 的模型请求」。
+    // 这一条是模型下拉框会不会被改写的唯一可靠依据，也是用户「配了却看不到模型」的根因所在。
+    let target_label = match target.as_str() {
+        "devin" => "Devin",
+        "cursor" => "Cursor",
+        _ => "Windsurf",
+    };
+    // 心跳只覆盖 MITM/hybrid 通道（Windsurf / Devin）。Cursor 走 cursor-core 独立通道、
+    // Antigravity 走自己的端点，都不经过这个代理，套用心跳会误报「接管未生效」。
+    let takeover_supported = matches!(target.as_str(), "devin" | "windsurf");
+    if !takeover_supported {
+        // 不做判定，也不产生误导性提示
+    } else if !is_port_free(ports.api_port) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        match read_takeover_state(&config_dir) {
+            Ok(Some(state)) => {
+                let since_start = state
+                    .proxy_started_at
+                    .map(|ts| now_ms.saturating_sub(ts))
+                    .unwrap_or(TAKEOVER_WARMUP_MS);
+                match state.last_ide_request_at {
+                    Some(ts) if now_ms.saturating_sub(ts) <= TAKEOVER_FRESH_WINDOW_MS => {
+                        push_issue(
+                            &mut issues,
+                            "ok",
+                            "takeover.active",
+                            format!(
+                                "IDE 接管已生效：{} 秒前收到 {} 的模型请求，模型下拉框会被改写。",
+                                now_ms.saturating_sub(ts) / 1000,
+                                target_label
+                            ),
+                        );
+                    }
+                    _ if since_start < TAKEOVER_WARMUP_MS => {
+                        push_issue(
+                            &mut issues,
+                            "warn",
+                            "takeover.waiting",
+                            format!(
+                                "代理刚启动，还在等待 {} 的模型请求。请重启 {} 并打开一次模型选择器。",
+                                target_label, target_label
+                            ),
+                        );
+                    }
+                    other => {
+                        let detail = match other {
+                            Some(ts) => format!(
+                                "（最后一次是 {} 分钟前）",
+                                now_ms.saturating_sub(ts) / 60000
+                            ),
+                            None => String::new(),
+                        };
+                        push_issue(
+                            &mut issues,
+                            "err",
+                            "takeover.not_active",
+                            format!(
+                                "IDE 接管未生效{}：代理启动后没有收到 {} 的模型请求，模型下拉框不会被改写。原因几乎都是 {} 在写入代理配置之后没有重启（macOS 必须 Cmd+Q 完全退出，关窗口不算）。请在「平台 > 设置 > 环境检测」点「重启 IDE」。",
+                                detail, target_label, target_label
+                            ),
+                        );
+                    }
+                }
+            }
+            Ok(None) => push_issue(
+                &mut issues,
+                "err",
+                "takeover.no_state",
+                format!(
+                    "代理正在运行，但还没有任何接管记录。请重启 {} 让代理配置生效，然后打开一次模型选择器。",
+                    target_label
+                ),
+            ),
+            Err(e) => push_issue(&mut issues, "err", "takeover.state_read_failed", e),
+        }
+    } else {
+        push_issue(
+            &mut issues,
+            "warn",
+            "takeover.proxy_stopped",
+            "代理未运行，无法判断 IDE 是否已接管。请先启动代理，再重启 IDE。",
+        );
     }
 
     for port in unique_proxy_ports(ports) {

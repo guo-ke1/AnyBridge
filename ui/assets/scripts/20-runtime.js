@@ -751,8 +751,23 @@ async function toggleProxy(mode = 'toggle') {
         }
         await refreshStatus();
       }
-      addLog('info', `${label} 已接入 AnyBridge`);
-      if (typeof showBottomToast === 'function') showBottomToast(`${label} 已接入 AnyBridge`, 'info');
+      // 已 patched 只代表配置写进了 settings.json，不代表生效：IDE 只在启动时读取它。
+      // 用「接管心跳」判断流量是否真的进了代理。之前这里直接 return，
+      // 导致错过第一次重启弹窗的用户再也得不到任何提示（IDE 永远显示官方原模型）。
+      const takeover = await readTakeoverStateSafe();
+      const takeoverFresh = isTakeoverFresh(takeover);
+      if (!takeoverFresh && takeoverWarmupElapsed(takeover)) {
+        await promptRestartIde(
+          `${label} 已接入，但代理还没收到 ${label} 的模型请求 —— 通常是 ${label} 在写入代理配置后没有重启（macOS 必须 Cmd+Q 完全退出）。重启后配置才会生效。`,
+          target,
+          { mode: 'proxy' },
+        );
+        return;
+      }
+      addLog('info', takeoverFresh ? `${label} 已接入 AnyBridge（接管已生效）` : `${label} 已接入 AnyBridge，等待 ${label} 连接`);
+      if (typeof showBottomToast === 'function') {
+        showBottomToast(takeoverFresh ? `${label} 已接入 AnyBridge` : `${label} 已接入，请重启 ${label} 生效`, takeoverFresh ? 'info' : 'warn');
+      }
       return;
     }
 
@@ -923,6 +938,32 @@ async function refreshStatus() {
     _refreshStatusInFlight = false;
   }
 }
+// ─── 接管心跳 ───
+// IDE 只在启动时读取 settings.json 里的代理配置，所以「配置已写入(patched)」不等于生效。
+// 唯一可靠判据是「代理最近有没有收到该 IDE 的模型请求」，由 sidecar 落盘到
+// anybridge-takeover-state.json。以下阈值必须与 Rust proxy.rs 中的同名常量保持一致。
+const TAKEOVER_FRESH_WINDOW_MS = 10 * 60 * 1000;
+const TAKEOVER_WARMUP_MS = 90 * 1000;
+
+async function readTakeoverStateSafe() {
+  if (!invoke) return null;
+  try {
+    return await invoke('get_takeover_state');
+  } catch (_) {
+    return null; // 读不到时退回旧行为，不阻断主流程
+  }
+}
+
+function isTakeoverFresh(state) {
+  const last = Number(state && state.lastIdeRequestAt) || 0;
+  return last > 0 && (Date.now() - last) <= TAKEOVER_FRESH_WINDOW_MS;
+}
+
+function takeoverWarmupElapsed(state) {
+  const started = Number(state && state.proxyStartedAt) || 0;
+  return started <= 0 || (Date.now() - started) > TAKEOVER_WARMUP_MS;
+}
+
 async function restartIdeNow(target) {
   try {
     const result = await invoke('restart_ide', { target });

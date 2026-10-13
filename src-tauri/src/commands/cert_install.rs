@@ -126,7 +126,7 @@ fn is_san_current(cert_path: &Path, cert_exists: bool, key_exists: bool) -> bool
             .unwrap_or(false)
 }
 
-fn current_user_store_label() -> &'static str {
+pub(crate) fn current_user_store_label() -> &'static str {
     #[cfg(target_os = "windows")]
     {
         "CurrentUser\\Root"
@@ -145,7 +145,7 @@ fn current_user_store_label() -> &'static str {
     }
 }
 
-fn local_machine_store_label() -> &'static str {
+pub(crate) fn local_machine_store_label() -> &'static str {
     #[cfg(target_os = "windows")]
     {
         "LocalMachine\\Root"
@@ -161,6 +161,18 @@ fn local_machine_store_label() -> &'static str {
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         "system trust store"
+    }
+}
+
+/// 按实际生效的信任库返回**当前平台**的称呼。
+///
+/// 早期实现直接 Debug 打印 `CaStore` 枚举（或硬编码 `LocalMachine\Root`），
+/// 导致 macOS / Linux 用户看到 Windows 专属字样，误以为证书装错了位置。
+pub(crate) fn store_label(store: CaStore) -> &'static str {
+    match store {
+        CaStore::CurrentUser => current_user_store_label(),
+        CaStore::LocalMachine => local_machine_store_label(),
+        CaStore::None => "未安装",
     }
 }
 
@@ -1575,7 +1587,7 @@ fn install_ca_impl(
                 emit_cert_progress(
                     app.as_ref(),
                     "verify_current_user",
-                    "正在验证 CurrentUser\\Root 中的证书指纹",
+                    &format!("正在验证 {} 中的证书指纹", current_user_store_label()),
                     55,
                     "info",
                 );

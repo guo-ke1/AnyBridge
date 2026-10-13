@@ -13,8 +13,10 @@
 //    自定义接入模型本地拦截并转换上游协议，官方模型透明走科学透传。
 
 import fs from 'node:fs';
+import path from 'node:path';
 import https from 'node:https';
 import { httpsAgentFor } from '../system-proxy.js';
+import { configDir } from './config-dir.js';
 
 export const OFFICIAL_ANTIGRAVITY_HOSTS = [
   'daily-cloudcode-pa.googleapis.com',
@@ -848,7 +850,8 @@ function raceOfficialSuccess(promises) {
 
 function logHandshake(line, body) {
   try {
-    const dir = process.env.APPDATA ? `${process.env.APPDATA}/AnyBridge` : '.';
+    // 旧实现在 macOS/Linux 上回退到 '.'（进程当前目录），日志会散落在任意位置。
+    const dir = configDir();
     let entry = `${new Date().toISOString()} ${line}\n`;
     if (body) {
       // 仅截取响应头部用于诊断（完整响应可能达数十 KB 且周期性调用）

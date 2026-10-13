@@ -1492,6 +1492,40 @@ fn set_sandbox_compat_flag(platform: &str, enabled: bool) {
     }
 }
 
+/// 按 `.app` 安装路径直接扫描进程 PID（macOS）。
+///
+/// 刻意不复用 `unix_ide_pids` 的启发式匹配：Devin 的主进程可能仍叫 Windsurf，
+/// 启发式匹配一旦漏判，会同时漏掉「杀进程」和「是否已退出」两件事，
+/// 于是出现"进程没死却判定成功、open -a 只是激活已运行实例"的假重启。
+/// 这里只认安装路径，命中即算该 IDE 的进程（含 Electron 的 helper 子进程）。
+#[cfg(target_os = "macos")]
+fn macos_running_pids_for(app: &std::path::Path) -> Vec<u32> {
+    let needle = app.to_string_lossy().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let Ok(out) = Command::new("ps").args(["-ax", "-o", "pid=,command="]).output() else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let (Some(pid_str), Some(cmd)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            if cmd.to_lowercase().contains(&needle) {
+                pids.push(pid);
+            }
+        }
+    }
+    pids
+}
+
 fn restart_ide_impl(target: String) -> Result<String, String> {
     let t = if target == "auto" {
         detect_target_ide()
@@ -1684,33 +1718,50 @@ fn restart_ide_impl(target: String) -> Result<String, String> {
         let app = find_ide_app(&t)
             .ok_or_else(|| format!("未找到 {}.app，请手动重启", ide_dir_name(&t)))?;
 
-        // 优先按路径过滤后的 PID 杀（覆盖 Devin 主进程仍叫 Windsurf 的情况）。
-        // 回退 killall 仅用安全进程名，绝不因 Devin 去 killall Windsurf。
-        let pids = unix_ide_pids(&t);
-        if pids.is_empty() {
-            for name in unix_ide_fallback_kill_names(&t) {
-                let _ = Command::new("killall").args([name]).output();
-            }
-        } else {
-            for pid in pids {
-                let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
-            }
-        }
+        let was_running = !macos_running_pids_for(&app).is_empty();
 
-        // 等待进程退出，最多 3 秒
-        let mut dead = false;
-        for _ in 0..6 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if !is_ide_running(t.clone()) {
-                dead = true;
-                break;
+        if was_running {
+            // 最多 3 轮：Electron 的 helper 子进程可能在主进程死后才陆续退出。
+            for round in 0..3 {
+                let pids = macos_running_pids_for(&app);
+                if pids.is_empty() {
+                    break;
+                }
+                for pid in pids {
+                    let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+                }
+                if round == 0 {
+                    // 兜底再按安全进程名清一次（Devin 只 killall "Devin"，绝不误杀 Windsurf）
+                    for name in unix_ide_fallback_kill_names(&t) {
+                        let _ = Command::new("killall").args([name]).output();
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
-        }
-        if !dead {
-            return Err(format!(
-                "{} 进程未能终止，请手动关闭后重试",
-                ide_dir_name(&t)
-            ));
+
+            // 真实验证：按 .app 路径复查必须清零。绝不用会漏判的启发式判定，
+            // 否则 open -a 只是 activate 已运行的实例，界面却报"已重启"。
+            let mut dead = false;
+            for _ in 0..8 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if macos_running_pids_for(&app).is_empty() {
+                    dead = true;
+                    break;
+                }
+            }
+            if !dead {
+                let remaining = macos_running_pids_for(&app);
+                return Err(format!(
+                    "{} 进程未能终止（仍有 {} 个进程：{}），请手动退出后重试",
+                    ide_dir_name(&t),
+                    remaining.len(),
+                    remaining
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
         }
 
         Command::new("open")
@@ -1718,6 +1769,23 @@ fn restart_ide_impl(target: String) -> Result<String, String> {
             .arg(&app)
             .spawn()
             .map_err(|e| format!("重启 {} 失败: {}", ide_dir_name(&t), e))?;
+
+        // 拉起后复查：确实出现了新进程，才算真的重启成功。
+        let mut launched = false;
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if !macos_running_pids_for(&app).is_empty() {
+                launched = true;
+                break;
+            }
+        }
+        if !launched {
+            return Err(format!(
+                "{} 已退出但未能重新拉起，请手动打开 {}",
+                ide_dir_name(&t),
+                app.display()
+            ));
+        }
 
         Ok(format!("已重启 {}", ide_dir_name(&t)))
     }
