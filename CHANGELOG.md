@@ -2,6 +2,14 @@
 
 All notable changes to AnyBridge will be documented in this file.
 
+## v0.5.31 - 2026-10-13
+
+- 修复 macOS 上「安装证书 / 清理并重装」必须管理员授权、授权失败后把可用状态搞坏的问题：
+  - 根因一：macOS 的 `security add-trusted-cert` 带了 `-d`，那是「写入**管理员**信任设置」，会让本该免密的用户级安装也要求管理员密码。已去掉 `-d`，用户级安装恢复为真正的免密路径。
+  - 根因二：允许提权时会跳过用户级直接要管理员授权，而这个「跳过」的理由是 Windows 专属的（避免 Windows 安全警告弹窗），在 macOS 上并不成立。现在 macOS 上**先试用户级（login keychain），失败才提权**，多数用户不再需要输入管理员密码。
+  - 提权被拒时（常见原因是没看到系统弹窗）不再只回一句原始错误，而是：说清当前状态（证书已重生但信任库没有、IDE 会报 bad certificate），并给出**本平台可直接复制的手动安装命令**（macOS: 钥匙串访问设为「始终信任」或 `sudo security add-trusted-cert ...`；Windows: `certutil -addstore Root`；Linux: `update-ca-certificates`）。
+  - 提权前先提示「接下来会弹系统授权窗口，可能被其它窗口挡住或在另一个桌面」，减少「没看到弹窗」。
+
 ## v0.5.30 - 2026-10-13
 
 - 修复「IDE 里看不到自备模型」最常被卡住的一环：IDE 写入代理配置后必须重启才生效，但产品没有把这件事闭环。
