@@ -2,6 +2,14 @@
 
 All notable changes to AnyBridge will be documented in this file.
 
+## v0.5.34 - 2026-10-14
+
+- 修复客户端报「响应数据无效 / Expected 'id' to be a string」（错误码 10014）的问题：
+  - 成因：官方 API 的 `id` 一定是字符串，所以客户端（CodeBuddy/ZCode/WorkBuddy/OpenCode 等）的 schema 校验从不报错；一旦经 AnyBridge 中转到第三方供应商，上游可能返回数字 id、null 或干脆不带 id，而我们原先**原样透传**，客户端校验就失败了。
+  - Chat SSE 透传路径现在会规范化 `id`（非字符串就补一个 `chatcmpl-<uuid>`，同一条流内保持稳定）、`object` 固定为 `chat.completion.chunk`、`created` 兜底为数字。合规上游的字段原样保留，不做任何改写。
+  - Anthropic 出口的 `message.id` 同样收敛为字符串（数字也转成字符串，缺失才自己生成）。
+  - 补充单元测试覆盖：数字 id、缺失 id、id 稳定性、object/created 兜底。
+
 ## v0.5.33 - 2026-10-14
 
 - 修复 Responses 请求中**省略 `type` 的 input 项被静默丢弃**：`responsesToChatCompletions` 只按 `item.type` 分支匹配，而 Responses API 允许 message 项只写 `role` / `content`（`type` 可省略）。这类项会掉进"谁都不认识"的分支被丢弃，最终上游收到**空 messages**（Gemini 系直接报 `contents is not specified` 400），客户端看到的是莫名其妙的 400。

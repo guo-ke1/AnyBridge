@@ -2408,7 +2408,15 @@ function sendOpenAIResponses(ctx, res, result) {
 function sendAnthropic(ctx, res, result) {
   const extra = result.extraHeaders || {};
   const echoModel = ctx.originalModel || ctx.model;
-  const messageId = result.json?.id || `msg_${crypto.randomUUID().replace(/-/g, '')}`;
+  // 上游 id 可能是数字/其它类型（第三方中转站常见），而 Anthropic 规范的 message.id
+  // 必须是字符串，客户端 schema 校验会直接失败（Expected 'id' to be a string）。
+  // 这里统一收敛：字符串原样用，其它非空标量转字符串，缺失才自己生成。
+  const rawMessageId = result.json?.id;
+  const messageId = typeof rawMessageId === 'string' && rawMessageId.trim()
+    ? rawMessageId
+    : ((typeof rawMessageId === 'number' || typeof rawMessageId === 'bigint') && String(rawMessageId).trim()
+      ? String(rawMessageId)
+      : `msg_${crypto.randomUUID().replace(/-/g, '')}`);
 
   let content = [];
   let stopReason = 'end_turn';
