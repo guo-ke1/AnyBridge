@@ -58,9 +58,32 @@ if [ "$READY" -ne 1 ]; then
   exit 1
 fi
 
-# 2) 上传重试（--clobber 保证幂等覆盖）
+# 2) 先按名字精确删除已存在的同名资产，再上传。
+#
+# 为什么不再用 `gh release upload --clobber`：它内部是「按缓存的资产列表逐个 DELETE，
+# 再上传」。列表缓存过时会先 404（删了一个已经不存在的 id），紧接着上传又 422
+# （ReleaseAsset.name already exists）——两次失败互为因果，重试多少次都重复同一场竞态。
+# v0.5.30、v0.5.34 发布时同步到公开仓库就是这样失败的，结果公开仓库少了 8 个更新
+# 元数据，用户自动更新静默失效，只能手动补传。
+#
+# 这里改为「按当前列表精确删除同名资产 → 上传」，删除与上传都各自容错，状态可收敛。
+delete_existing_assets() {
+  local names base
+  names="$(gh release view "$TAG" --repo "$REPO" --json assets --jq -r '.assets[].name' 2>/dev/null)"
+  [ -z "$names" ] && return 0
+  for f in "${FILES[@]}"; do
+    base="$(basename "$f")"
+    if printf '%s\n' "$names" | grep -Fxq "$base"; then
+      echo "删除已存在的同名资产: $base"
+      gh release delete-asset "$TAG" --repo "$REPO" "$base" --yes 2>/dev/null || \
+        echo "::warning::删除 $base 失败（可能已被并发删除），继续上传"
+    fi
+  done
+}
+
 for attempt in $(seq 1 6); do
-  if gh release upload "$TAG" --repo "$REPO" "${FILES[@]}" --clobber; then
+  delete_existing_assets
+  if gh release upload "$TAG" --repo "$REPO" "${FILES[@]}"; then
     echo "已上传 ${#FILES[@]} 个资产到 $REPO:$TAG（第 $attempt 次尝试）"
     exit 0
   fi
