@@ -2,6 +2,12 @@
 
 All notable changes to AnyBridge will be documented in this file.
 
+## v0.5.33 - 2026-10-14
+
+- 修复 Responses 请求中**省略 `type` 的 input 项被静默丢弃**：`responsesToChatCompletions` 只按 `item.type` 分支匹配，而 Responses API 允许 message 项只写 `role` / `content`（`type` 可省略）。这类项会掉进"谁都不认识"的分支被丢弃，最终上游收到**空 messages**（Gemini 系直接报 `contents is not specified` 400），客户端看到的是莫名其妙的 400。
+  - 修复：没有 `type` 但带 `role` 或 `content` 的项按 message 处理。
+  - 触发面：`wireApi: chat` 的供应商（走 Responses→Chat 转换）会命中；Cursor 自身请求带 `type: "message"`，不受影响。
+
 ## v0.5.32 - 2026-10-14
 
 - 修复 Cursor 接管后「发消息一直转圈 / 无任何回复」：本地代理对**全路由表**构建「对外模型 ID → 路由」查找表时，只要有一条路由配置打架就整体抛错，导致**所有模型**（包括与该冲突毫无关系的模型）全部 502。

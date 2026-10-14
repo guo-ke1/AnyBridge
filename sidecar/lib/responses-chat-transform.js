@@ -66,7 +66,10 @@ function appendResponsesInputAsChatMessages(inputItems, messages, toolCtx) {
   let pendingToolCalls = [];
   for (const item of inputItems) {
     if (!item || typeof item !== 'object') continue;
-    const type = item.type || '';
+    // Responses API 允许 message 项省略 type（用 role/content 表达）。
+    // 之前只按 type 匹配，省略 type 的项会静默掉进"谁都不认识"的分支被丢弃，
+    // 表现为上游收到空 messages（Gemini 系直接 400: contents is not specified）。
+    const type = item.type || ((item.role || item.content) ? 'message' : '');
     if (type === 'function_call') {
       pendingToolCalls.push({
         id: item.call_id || item.id || `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
