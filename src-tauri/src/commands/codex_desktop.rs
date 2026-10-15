@@ -920,7 +920,6 @@ fn inject_via_sidecar() -> Result<String, String> {
 }
 
 /// POST sidecar /__byok/codex-cdp/inject，指定 CDP 端口（动态端口用）。
-#[cfg(target_os = "windows")]
 fn inject_via_sidecar_on_port(cdp_port: u16) -> Result<String, String> {
     let ports = configured_proxy_ports();
     let port = ports.api_port;
