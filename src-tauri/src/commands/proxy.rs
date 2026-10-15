@@ -2554,6 +2554,26 @@ pub fn start_proxy_impl(
 
     let config_dir = crate::commands::config::config_dir_path();
     let ports = configured_ports();
+    // 记录用户请求值和解析结果，便于区分自动检测/保存配置导致的目标 IDE 偏差。
+    let requested_target = target_ide.as_deref().unwrap_or("saved/auto");
+    let settings_path = crate::commands::ide_config::settings_path(&target);
+    let _ = app.emit(
+        "proxy-log",
+        LogLine {
+            level: "info".into(),
+            msg: format!(
+                "代理启动诊断: requested_target={} resolved_target={} settings={} api_port={} inference_port={}",
+                requested_target,
+                target,
+                settings_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "unresolved".into()),
+                ports.api_port,
+                ports.inference_port,
+            ),
+        },
+    );
 
     let resource_dir = app
         .path()
@@ -2718,6 +2738,33 @@ pub fn start_proxy_impl(
             false
         }
     };
+    // 回读落盘配置，确认代理地址和 Devin 专用设置确实写入目标 IDE 的 settings 文件。
+    match crate::commands::ide_config::status(&target) {
+        Ok(status) => {
+            let _ = app.emit(
+                "proxy-log",
+                LogLine {
+                    level: if status.patched { "info" } else { "warn" }.into(),
+                    msg: format!(
+                        "IDE 配置复核: target={} patched={} proxy={} settings={}",
+                        target,
+                        status.patched,
+                        status.proxy_value,
+                        status.settings_path,
+                    ),
+                },
+            );
+        }
+        Err(error) => {
+            let _ = app.emit(
+                "proxy-log",
+                LogLine {
+                    level: "warn".into(),
+                    msg: format!("IDE 配置复核失败: target={} error={}", target, error),
+                },
+            );
+        }
+    }
 
     // 注入卡片改写脚本到 workbench.html（失败不阻断代理启动，仅记日志）。
     if target == "cursor" {
@@ -2889,12 +2936,18 @@ pub fn start_proxy_impl(
         return Err(msg);
     }
 
+    // 本地健康检查只证明 sidecar 可用；真实 IDE 接管需等待模型状态请求心跳。
     if missing_ports.is_empty() {
         let _ = app.emit(
             "proxy-log",
             LogLine {
                 level: "ok".into(),
-                msg: format!("✅ 代理健康检查通过: {}", port_pair_text(ports)),
+                msg: format!(
+                    "✅ 代理健康检查通过: target={} pid={} {}；IDE 请求心跳将在收到 Devin/Windsurf 模型状态请求后更新",
+                    target,
+                    proxy_pid,
+                    port_pair_text(ports),
+                ),
             },
         );
     } else {
@@ -2955,6 +3008,19 @@ fn start_proxy_service_impl_with_repair(
     let config_dir = crate::commands::config::config_dir_path();
     let ports = configured_ports();
     let cert_path = config_dir.join("certs").join("server.codeium.com.pem");
+    // 后台启动同样记录运行目录和端口，便于与 UI 手动启动的日志区分。
+    let _ = app.emit(
+        "proxy-log",
+        LogLine {
+            level: "info".into(),
+            msg: format!(
+                "后台代理启动诊断: config_dir={} api_port={} inference_port={}",
+                config_dir.display(),
+                ports.api_port,
+                ports.inference_port,
+            ),
+        },
+    );
     let resource_dir = app
         .path()
         .resource_dir()
@@ -3063,6 +3129,13 @@ fn start_proxy_service_impl_with_repair(
     let stderr = child.stderr.take();
     // 记录本轮进程身份，后续监控及健康检查失败只能处理这一个进程。
     let proxy_pid = child.id();
+    let _ = app.emit(
+        "proxy-log",
+        LogLine {
+            level: "info".into(),
+            msg: format!("后台 sidecar 已创建: pid={} api_port={}", proxy_pid, ports.api_port),
+        },
+    );
 
     *lock_or_recover(&state.child) = Some(ManagedChild {
         child: Mutex::new(child),

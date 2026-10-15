@@ -239,6 +239,7 @@ let lastModelListSig = '';
 let lastModelListCapturedAt = 0;
 let lastModelCaptureLogAt = 0;
 let lastModelRewriteLogAt = 0;
+let lastTakeoverLogAt = 0;
 // unlockModels 结果缓存：同一秒内输入相同 → 复用上次结果
 let lastUnlockInputSig = '';
 let lastUnlockResult = null;
@@ -593,6 +594,10 @@ function proxyToCodeium(req, res, body, id, opts = {}) {
         if (shouldRewriteModels) {
           // 接管心跳：这一条请求证明 IDE 的流量确实经过了代理
           noteTakeoverRequest(upstream);
+          if (Date.now() - lastTakeoverLogAt >= 10000) {
+            lastTakeoverLogAt = Date.now();
+            console.log(`  [#${id}] takeover heartbeat: target=${upstream === 'server.codeium.com' ? 'devin' : 'windsurf'} method=${method} status=${proxyRes.statusCode}`);
+          }
           // 抓取原始模型清单(改名前)→ 缓存供 GUI 添加映射时选用（仅 GetUserStatus，清单最全）。
           // 性能优化：每秒 8-10 次心跳 → 节流到 30s 一次 + 签名比对
           // 注意：unlockModels 仍然每次都做（必须做，下拉框要看到 BYOK 项）
