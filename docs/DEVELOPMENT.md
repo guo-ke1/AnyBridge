@@ -5,7 +5,7 @@
 ## Requirements
 
 - Node.js 20+
-- Rust stable
+- Rust stable installed through rustup (`cargo` and `rustc` required)
 - Tauri v2 CLI through `@tauri-apps/cli`
 - Platform-specific Tauri native dependencies
 
@@ -17,12 +17,16 @@ Windows certificate installation uses CurrentUser\Root first and requests UAC on
 
 ## Install
 
+Install Rust stable from https://rustup.rs/ and restart the terminal so the updated PATH is available. macOS also requires Xcode Command Line Tools; Windows requires the MSVC workload from Visual Studio C++ Build Tools.
+
 ```bash
 npm install
 cd sidecar
 npm install
 cd ..
 ```
+
+Run `npm run check:rust` to verify the local Rust toolchain. Tauri dev/build and cursor-core build/check scripts run this check first; the sidecar itself is Node.js-only and does not require Rust.
 
 ## Run
 

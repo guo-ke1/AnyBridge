@@ -29,6 +29,9 @@ import { extractModelList, unlockModels } from './rename-models.js';
 import { mitmLog, rpcAuditLog } from './mitm-logger.js';
 import { httpsAgentFor } from './system-proxy.js';
 import { attachPluginRoutes } from './plugin-loader.js';
+import { createRateLimitedLogger } from './lib/log-rate-limit.js';
+
+Object.assign(console, createRateLimitedLogger(console));
 
 function intEnv(name, fallback, min = 1) {
   const n = parseInt(process.env[name] || '', 10);
@@ -210,6 +213,8 @@ let requestCounter = 0;
 // `unknown ca`、`certificate verify failed`。
 // 出现这类错误时 MITM 直接断，模型改写不会执行（表现为"还是原模型"），必须让人能自查。
 const CA_COMMON_NAME_HINT = '「AnyBridge Local CA」';
+const CERT_REJECTION_LOG_INTERVAL_MS = 60_000;
+let lastCertRejectionLogAt = 0;
 function mitmCertRejected(err) {
   const text = String((err && (err.message || err.code)) || '').toLowerCase();
   if (!text) return false;
@@ -1297,11 +1302,17 @@ server.on('connect', (req, clientSocket, head) => {
       // 客户端不认我们的证书时，光甩一行 OpenSSL 内部错误没人看得懂，
       // 直接把排查动作写清楚（这种失败会导致模型改写不生效，表现为"还是原模型"）。
       if (mitmCertRejected(err)) {
-        console.error(
-          `  [#${id}] ❗ 客户端拒绝了 MITM 证书 → 请到「平台(智能体) > 设置 > 环境检测」点「清理并重装」，` +
-          '并在系统弹窗里允许授权；然后完全退出 IDE 再打开。若仍失败，检查系统钥匙串/证书库里 ' +
-          `${CA_COMMON_NAME_HINT} 是否为「始终信任」。`
-        );
+        // 原始 TLS 错误仍逐次记录；只节流重复结构事件和操作指引，避免握手风暴刷屏。
+        const nowMs = Date.now();
+        if (nowMs - lastCertRejectionLogAt >= CERT_REJECTION_LOG_INTERVAL_MS) {
+          lastCertRejectionLogAt = nowMs;
+          console.error('ANYBRIDGE_EVENT:TLS_CLIENT_CERT_REJECTED');
+          console.error(
+            `  [#${id}] ❗ 客户端拒绝了 MITM 证书 → 请到「平台(智能体) > 设置 > 环境检测」点「清理并重装」，` +
+            '并在系统弹窗里允许授权；然后完全退出 IDE 再打开。若仍失败，检查系统钥匙串/证书库里 ' +
+            `${CA_COMMON_NAME_HINT} 是否为「始终信任」。`
+          );
+        }
       }
       if (!clientSocket.destroyed) clientSocket.destroy();
     });
