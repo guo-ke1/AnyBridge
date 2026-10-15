@@ -239,8 +239,6 @@ let lastModelListSig = '';
 let lastModelListCapturedAt = 0;
 let lastModelCaptureLogAt = 0;
 let lastModelRewriteLogAt = 0;
-// Devin CLI 模型列表与 GetUserStatus 是不同数据源，单独限频避免被通用改写日志遮住。
-let lastCliModelRewriteLogAt = 0;
 let lastTakeoverLogAt = 0;
 // unlockModels 结果缓存：同一秒内输入相同 → 复用上次结果
 let lastUnlockInputSig = '';
@@ -591,6 +589,7 @@ function proxyToCodeium(req, res, body, id, opts = {}) {
         //   - 注入项（model-map.json 的 injected）→ label 改写为 "(BYOK) {label} (服务商/未配置)" + 解锁
         //   - 全部解锁（删 field4 disabled = true）让下拉框灰色项可点
         let stripEncoding = false;
+        let cliRewriteDiagnostic = null;
         const shouldRewriteModels = proxyRes.statusCode === 200
           && (method === 'GetUserStatus' || method === 'GetCliModelConfigs');
         if (shouldRewriteModels) {
@@ -627,12 +626,21 @@ function proxyToCodeium(req, res, body, id, opts = {}) {
             }
           }
           try {
-            // 节流：unlockModels 是个完整改写。心跳频繁 → 1s 内同一响应只跑一次
-            // 用 resBody 的 sha1 短路——上游响应没变，直接复用上次结果
+            // 相同响应和配置复用已计算结果，避免高频心跳重复解析大块 protobuf。
             const inputSig = `${method}|${crypto.createHash('sha1').update(resBody).digest('hex').slice(0, 16)}|${rewriteConfigSignature()}`;
             const responseBytes = resBody.length;
+            const contentType = String(proxyRes.headers['content-type'] || '-');
+            const contentEncoding = String(proxyRes.headers['content-encoding'] || '-');
+            const connectEncoding = String(proxyRes.headers['connect-content-encoding'] || '-');
+            // 只检查 gzip magic bytes 和 Connect 帧长度，不解码或记录 protobuf 正文。
+            const isGzip = resBody[0] === 0x1f && resBody[1] === 0x8b;
+            const frameLength = resBody.length >= 5 ? resBody.readUInt32BE(1) : -1;
+            const isConnectFrame = (resBody[0] === 0 || resBody[0] === 1)
+              && frameLength === resBody.length - 5;
+            const inputFormat = isGzip ? 'gzip' : (isConnectFrame ? `Connect帧(flags=${resBody[0]})` : '裸protobuf/其他');
+            const cacheHit = inputSig === lastUnlockInputSig && !!lastUnlockResult;
             let rewriteResult;
-            if (inputSig === lastUnlockInputSig && lastUnlockResult) {
+            if (cacheHit) {
               rewriteResult = lastUnlockResult;
               resBody = rewriteResult.body;
               if (rewriteResult.wasConnect) stripEncoding = true;
@@ -646,14 +654,17 @@ function proxyToCodeium(req, res, body, id, opts = {}) {
               }
             }
             if (method === 'GetCliModelConfigs') {
-              // 单独记录 CLI 数据源，且缓存命中时也记录，才能确认实际返回给 Devin 的内容经过改写。
-              if (Date.now() - lastCliModelRewriteLogAt > 5000) {
-                const outcome = rewriteResult
-                  ? `已改写 ${rewriteResult.changed} 个模型`
-                  : '未改写（响应格式未识别或当前配置无适用项）';
-                console.log(`  [#${id}] 🔄 ${method}：${outcome}，上游响应 ${responseBytes} 字节`);
-                lastCliModelRewriteLogAt = Date.now();
-              }
+              // CLI 请求同一轮可能并发出现多次，不做时间限频；仅记录格式和大小，不记录模型正文或凭据。
+              cliRewriteDiagnostic = {
+                responseBytes,
+                inputFormat,
+                contentType,
+                contentEncoding,
+                connectEncoding,
+                cacheHit,
+                changed: rewriteResult ? rewriteResult.changed : 0,
+                outputBytes: resBody.length,
+              };
             } else if (rewriteResult && Date.now() - lastModelRewriteLogAt > 5000) {
               console.log(`  [#${id}] 🔄 ${method}：已改写 ${rewriteResult.changed} 个模型（重命名、解锁、注入）`);
               lastModelRewriteLogAt = Date.now();
@@ -667,6 +678,13 @@ function proxyToCodeium(req, res, body, id, opts = {}) {
           stripEncoding,
           contentLength: resBody.length,
         });
+        if (cliRewriteDiagnostic) {
+          const d = cliRewriteDiagnostic;
+          const outcome = d.changed > 0 ? `已改写 ${d.changed} 个模型` : '未改写';
+          // 使用清洗后的响应头记录最终编码，Connect 帧重写时可能已移除上游编码声明。
+          const outputEncoding = resHeaders['content-encoding'] || '-';
+          console.log(`  [#${id}] 🔄 GetCliModelConfigs：${outcome}，缓存命中=${d.cacheHit ? '是' : '否'}，格式=${d.inputFormat}，上游=${d.responseBytes}字节/输出=${d.outputBytes}字节，类型=${d.contentType}，编码=${d.contentEncoding}，Connect编码=${d.connectEncoding}，返回编码=${outputEncoding}`);
+        }
         res.writeHead(proxyRes.statusCode, resHeaders);
         res.end(resBody);
       });
