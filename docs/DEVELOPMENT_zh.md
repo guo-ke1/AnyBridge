@@ -11,7 +11,7 @@
 
 Linux 在运行 Tauri 前需要安装：WebKitGTK 4.1、GTK 3、AppIndicator、OpenSSL、librsvg、patchelf、pkg-config、libnm 和 xdg-utils。
 
-macOS 需要 Xcode Command Line Tools。证书安装优先使用登录钥匙串（login keychain），仅当使用系统钥匙串路径时才会请求管理员授权。
+macOS 需要 Xcode Command Line Tools。证书安装优先使用登录钥匙串（login keychain），系统信任设置可能需要交互授权。常见 TLS、证书信任及授权问题见 [macOS 排障指南](MACOS_TROUBLESHOOTING_zh.md)。
 
 Windows 证书安装优先使用 CurrentUser\Root，仅当使用 LocalMachine\Root 路径时才会弹出 UAC 提权提示。
 
