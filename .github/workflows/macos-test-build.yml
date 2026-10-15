@@ -1,4 +1,4 @@
-name: macOS Test Build
+name: macOS 测试构建
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Test package (${{ matrix.target }})
+    name: 测试安装包（${{ matrix.target }}）
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -20,8 +20,6 @@ jobs:
         include:
           - runner: macos-15
             target: aarch64-apple-darwin
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
     env:
       RUST_TARGET: ${{ matrix.target }}
       NO_STRIP: "true"
@@ -49,7 +47,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Verify native toolchain
+      - name: 验证原生构建工具链
         run: |
           set -euo pipefail
           xcrun --find clang
@@ -57,18 +55,18 @@ jobs:
           HOST="$(rustc -vV | awk '/^host: / {print $2}')"
           test "$HOST" = "$RUST_TARGET"
 
-      - name: Install dependencies
+      - name: 安装依赖
         run: |
           npm ci
           npm ci --prefix sidecar
 
-      - name: Check UI and health behavior
+      - name: 检查界面与健康检测行为
         run: |
           npm run build:ui
           npm run check:ui
           node --test scripts/test-healthcheck.mjs
 
-      - name: Build external binaries
+      - name: 构建外部二进制组件
         run: |
           set -euo pipefail
           python scripts/build/build_sidecar_plain.py --platform "$RUST_TARGET"
@@ -76,10 +74,18 @@ jobs:
           test -s "src-tauri/binaries/anybridge-proxy-$RUST_TARGET"
           test -s "src-tauri/binaries/anybridge-cursor-core-$RUST_TARGET"
 
-      - name: Build local test package without updater artifacts
+      - name: 构建本地测试包（不生成更新器产物）
         run: node scripts/build/tauri_build.mjs --config src-tauri/tauri.local.conf.json --target "$RUST_TARGET" --bundles app,dmg
 
-      - name: Verify final bundle and sidecar JIT permissions
+      - name: 标记测试磁盘映像文件
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          images=("src-tauri/target/$RUST_TARGET/release/bundle/dmg/"*.dmg)
+          test "${#images[@]}" -eq 1
+          mv "${images[0]}" "${images[0]%.dmg}_test.dmg"
+
+      - name: 验证应用包与 Sidecar JIT 权限
         run: |
           set -euo pipefail
           APP="src-tauri/target/$RUST_TARGET/release/bundle/macos/AnyBridge.app"
@@ -98,10 +104,10 @@ jobs:
           required = ['com.apple.security.cs.allow-jit', 'com.apple.security.cs.allow-unsigned-executable-memory']
           missing = [key for key in required if entitlements.get(key) is not True]
           if missing:
-              raise SystemExit(f'Missing JIT entitlements: {missing}')
+              raise SystemExit(f'缺少 JIT 权限配置：{missing}')
           PY
 
-      - name: Isolated process smoke test (not TLS acceptance)
+      - name: 隔离进程冒烟测试（不验证 TLS）
         run: |
           python - <<'PY'
           import os
@@ -122,9 +128,9 @@ jobs:
                       try:
                           code = process.wait(timeout=5)
                       except subprocess.TimeoutExpired:
-                          print('Sidecar remained alive for five seconds; TLS and Keychain are not verified.')
+                          print('Sidecar 已持续运行 5 秒；本测试不验证 TLS 和 Keychain。')
                       else:
-                          raise SystemExit(f'Sidecar exited early: {code}')
+                          raise SystemExit(f'Sidecar 提前退出，退出码：{code}')
                   finally:
                       if process.poll() is None:
                           process.terminate()
@@ -135,10 +141,10 @@ jobs:
                               process.wait()
           PY
 
-      - name: Upload test disk image
+      - name: 上传测试磁盘映像
         uses: actions/upload-artifact@v6
         with:
-          name: AnyBridge-test-${{ matrix.target }}-${{ github.sha }}
-          path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          name: AnyBridge-测试包-${{ matrix.target }}-${{ github.sha }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*_test.dmg
           if-no-files-found: error
           retention-days: 14
