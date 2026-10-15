@@ -239,6 +239,8 @@ let lastModelListSig = '';
 let lastModelListCapturedAt = 0;
 let lastModelCaptureLogAt = 0;
 let lastModelRewriteLogAt = 0;
+// Devin CLI 模型列表与 GetUserStatus 是不同数据源，单独限频避免被通用改写日志遮住。
+let lastCliModelRewriteLogAt = 0;
 let lastTakeoverLogAt = 0;
 // unlockModels 结果缓存：同一秒内输入相同 → 复用上次结果
 let lastUnlockInputSig = '';
@@ -614,7 +616,8 @@ function proxyToCodeium(req, res, body, id, opts = {}) {
                     lastModelListSig = sig;
                     writeCapturedModelList(file, list);
                     noteTakeoverCapture(upstream);
-                    console.log(`  [#${id}] 📋 captured ${list.length} Windsurf models → ide-models.json`);
+                    const target = upstream === 'server.codeium.com' ? 'Devin' : 'Windsurf';
+                    console.log(`  [#${id}] 📋 已捕获 ${target} 模型 ${list.length} 个 → ide-models.json`);
                   }
                 }
               }
@@ -627,25 +630,36 @@ function proxyToCodeium(req, res, body, id, opts = {}) {
             // 节流：unlockModels 是个完整改写。心跳频繁 → 1s 内同一响应只跑一次
             // 用 resBody 的 sha1 短路——上游响应没变，直接复用上次结果
             const inputSig = `${method}|${crypto.createHash('sha1').update(resBody).digest('hex').slice(0, 16)}|${rewriteConfigSignature()}`;
+            const responseBytes = resBody.length;
+            let rewriteResult;
             if (inputSig === lastUnlockInputSig && lastUnlockResult) {
-              resBody = lastUnlockResult.body;
-              if (lastUnlockResult.wasConnect) stripEncoding = true;
+              rewriteResult = lastUnlockResult;
+              resBody = rewriteResult.body;
+              if (rewriteResult.wasConnect) stripEncoding = true;
             } else {
-              const result = unlockModels(resBody);
-              if (result) {
-                resBody = result.body;
-                if (result.wasConnect) stripEncoding = true;
-                lastUnlockResult = result;
+              rewriteResult = unlockModels(resBody);
+              if (rewriteResult) {
+                resBody = rewriteResult.body;
+                if (rewriteResult.wasConnect) stripEncoding = true;
+                lastUnlockResult = rewriteResult;
                 lastUnlockInputSig = inputSig;
-                // 5s 内只打一次 rewrite 日志
-                if (Date.now() - lastModelRewriteLogAt > 5000) {
-                  console.log(`  [#${id}] 🔄 ${method}: rewrote ${result.changed} model(s) (rename+unlock+inject)`);
-                  lastModelRewriteLogAt = Date.now();
-                }
               }
             }
+            if (method === 'GetCliModelConfigs') {
+              // 单独记录 CLI 数据源，且缓存命中时也记录，才能确认实际返回给 Devin 的内容经过改写。
+              if (Date.now() - lastCliModelRewriteLogAt > 5000) {
+                const outcome = rewriteResult
+                  ? `已改写 ${rewriteResult.changed} 个模型`
+                  : '未改写（响应格式未识别或当前配置无适用项）';
+                console.log(`  [#${id}] 🔄 ${method}：${outcome}，上游响应 ${responseBytes} 字节`);
+                lastCliModelRewriteLogAt = Date.now();
+              }
+            } else if (rewriteResult && Date.now() - lastModelRewriteLogAt > 5000) {
+              console.log(`  [#${id}] 🔄 ${method}：已改写 ${rewriteResult.changed} 个模型（重命名、解锁、注入）`);
+              lastModelRewriteLogAt = Date.now();
+            }
           } catch (e) {
-            console.error(`  [#${id}] rewrite models error: ${e.message}`);
+            console.error(`  [#${id}] 模型列表改写失败：${e.message}`);
           }
         }
 
