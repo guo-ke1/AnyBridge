@@ -98,6 +98,34 @@ test('Chat SSE passthrough rewrites model name only', () => {
   assert.deepEqual(c.write({ foo: 1 }), [], '非 chat chunk 忽略');
 });
 
+test('Chat SSE passthrough normalizes non-string id (第三方上游常见)', () => {
+  const base = (id) => ({ id, model: 'gpt-6-astra', choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: null }] });
+
+  // 数字 id → 字符串
+  const numeric = createChatSSEPassthrough('m');
+  assert.equal(typeof numeric.write(base(12345))[0].id, 'string');
+  assert.equal(numeric.write(base(12345))[0].id, '12345');
+
+  // 缺失 id → 补一个，且同一条流内保持稳定
+  const missing = createChatSSEPassthrough('m');
+  const first = missing.write(base(undefined))[0].id;
+  const second = missing.write(base(null))[0].id;
+  assert.equal(typeof first, 'string');
+  assert.ok(first.length > 0, 'id 不能是空串');
+  assert.equal(first, second, '同一条流的 id 必须稳定');
+
+  // 合规的字符串 id 原样保留，不被改写
+  const ok = createChatSSEPassthrough('m');
+  assert.equal(ok.write(base('chatcmpl-abc'))[0].id, 'chatcmpl-abc');
+
+  // object / created 同样兜底：流式出口必须是 chunk，created 必须是数字
+  const fixed = createChatSSEPassthrough('m', 'chatcmpl-x', 1700000000);
+  const out = fixed.write({ object: 'chat.completion', model: 'x', choices: [{ delta: { content: 'y' } }] })[0];
+  assert.equal(out.object, 'chat.completion.chunk');
+  assert.equal(typeof out.created, 'number');
+  assert.ok(out.created > 0);
+});
+
 test('createChatSSEConverter picks by upstream shape', () => {
   const anthropic = createChatSSEConverter({ format: 'anthropic', apiPath: '/v1/messages' }, 'm', ID, CREATED);
   assert.ok(anthropic.write({ type: 'message_stop' }).length === 1);

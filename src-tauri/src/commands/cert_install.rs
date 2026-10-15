@@ -266,6 +266,40 @@ fn admin_prompt_label() -> &'static str {
     }
 }
 
+/// 提权失败时给用户的「自助安装指引」。
+///
+/// 提权被拒（用户没看到系统弹窗 / 取消 / 无交互会话）时，只回一句原始错误毫无用处：
+/// 用户不知道下一步做什么。这里按平台给出可直接复制的命令。
+fn manual_install_hint(cert_path: &Path) -> String {
+    let p = cert_path.to_string_lossy().to_string();
+    #[cfg(target_os = "macos")]
+    {
+        let q = p.replace('\'', "'\\''");
+        format!(
+            "方式 A（推荐）：在「钥匙串访问」里双击 {p}，找到「AnyBridge Local CA」→ 双击 → 展开「信任」→ 「使用此证书时」选「始终信任」。\n\
+             方式 B：终端执行\n  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain '{q}'"
+        )
+    }
+    #[cfg(target_os = "windows")]
+    {
+        format!(
+            "以管理员身份打开 PowerShell 执行：\n  certutil -addstore Root \"{}\"",
+            p
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let q = p.replace('\'', "'\\''");
+        format!(
+            "终端执行：\n  sudo cp '{q}' /usr/local/share/ca-certificates/anybridge-local-ca.crt && sudo update-ca-certificates"
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        format!("请把 {} 手动加入系统信任库", p)
+    }
+}
+
 /// 计算 PEM 证书的 SHA1 Thumbprint。
 /// Windows 证书库里的 Thumbprint 是 X.509 DER 的 SHA1，不是 PEM 文本文件 hash。
 fn compute_thumbprint(pem_path: &Path) -> Result<String, String> {
@@ -1009,7 +1043,8 @@ mod platform {
 
     pub fn install_current_user(cert_path: &Path) -> Result<(), String> {
         let kc = login_keychain()?;
-        // -k 选择钥匙串，-d 选择管理员信任域；用户域不能加 -d，但仍可能要求交互授权。
+        // 用户级安装不能带 `-d`；该参数会写入管理员信任设置并触发管理员授权。
+        // 这里仅指定登录钥匙串，仍可能因钥匙串策略要求交互授权。
         run_security(
             &["add-trusted-cert", "-r", "trustRoot", "-k"],
             &[&kc, cert_path],
@@ -1810,10 +1845,17 @@ pub(crate) fn install_ca_impl_with_package_lock(
     // 因为 CurrentUser 安装会触发 Windows「安全警告」弹窗，而提权进程装 LocalMachine\Root
     // 不会弹该警告（UAC 提权本身就是授权门槛），实现「自动提权 + 静默无感」。
     // 调试 UAC 时可设置 ANYBRIDGE_FORCE_UAC_CERT_INSTALL=1 强制跳过本阶段。
-    if !allow_admin
-        && std::env::var_os("ANYBRIDGE_FORCE_UAC_CERT_INSTALL").is_none()
-        && std::env::var_os("IDE_BYOK_FORCE_UAC_CERT_INSTALL").is_none()
-    {
+    let force_admin = std::env::var_os("ANYBRIDGE_FORCE_UAC_CERT_INSTALL").is_some()
+        || std::env::var_os("IDE_BYOK_FORCE_UAC_CERT_INSTALL").is_some();
+    // macOS：用户级（login keychain）既不需要管理员密码，也不会弹「安全警告」，
+    // 所以即使允许提权也应先试用户级，失败再提权 —— 多数用户因此根本不用输管理员密码。
+    // Windows 相反：CurrentUser 安装会弹「安全警告」，允许提权时直接走 UAC 更干净。
+    #[cfg(target_os = "macos")]
+    let try_user_first = !force_admin;
+    #[cfg(not(target_os = "macos"))]
+    let try_user_first = !allow_admin && !force_admin;
+
+    if try_user_first {
         emit_cert_progress(
             app.as_ref(),
             "current_user",
@@ -1910,18 +1952,33 @@ pub(crate) fn install_ca_impl_with_package_lock(
         app.as_ref(),
         "admin",
         &format!(
-            "正在请求 {} 授权安装到 {}（请在当前平台的管理员授权界面确认；若未显示，请切换到本地登录的桌面会话）",
+            "正在请求 {} 授权安装到 {}，请按系统提示确认。授权窗口可能被其它窗口挡住或出现在另一个桌面；若未显示，请切换到本地登录的桌面会话。",
             admin_prompt_label(),
             local_machine_store_label()
         ),
         65,
         "warn",
     );
-    platform::install_local_machine_via_uac(&cert_path)?;
+    if let Err(e) = platform::install_local_machine_via_uac(&cert_path) {
+        emit_cert_progress(
+            app.as_ref(),
+            "error",
+            "授权未完成，证书尚未装入系统信任库",
+            100,
+            "err",
+        );
+        return Err(format!(
+            "{}授权未完成：{}\n\n当前状态：证书文件已{}，但系统信任库里没有它，IDE 会拒绝 MITM 证书（表现为模型列表/对话报 bad certificate）。\n\n请二选一：\n1）重新点「安装证书」或「清理并重装」，这次留意系统弹窗并输入密码；\n2）手动安装：\n{}\n\n完成后请完全退出 IDE（macOS 用 Cmd+Q）再打开。",
+            admin_prompt_label(),
+            e,
+            if force_regenerate { "重新生成" } else { "生成" },
+            manual_install_hint(&cert_path)
+        ));
+    }
     emit_cert_progress(
         app.as_ref(),
         "verify_local_machine",
-        "管理员授权完成，正在验证系统级证书存储中的证书指纹",
+        &format!("授权完成，正在验证 {} 中的证书指纹", local_machine_store_label()),
         90,
         "info",
     );

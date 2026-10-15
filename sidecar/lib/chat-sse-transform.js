@@ -7,6 +7,8 @@
 //   3. Chat SSE（普通 OpenAI Chat 上游，直接透传）
 // 三个转换器统一接口：write(event) → chunk[]，flush() → chunk[]，getUsage() → usage|null。
 
+import crypto from 'node:crypto';
+
 function chunkBase(id, created, model) {
   return { id, object: 'chat.completion.chunk', created, model };
 }
@@ -204,13 +206,46 @@ export function createChatSSEFromAnthropic(model, id, created) {
 }
 
 // ─── Chat SSE 透传（上游即 Chat 格式，仅改写 model 名） ────
-export function createChatSSEPassthrough(model) {
+//
+// 透传不等于「什么都不做」：上游是第三方供应商（中转站居多）时，chunk 的
+// `id` 可能是数字、null，甚至干脆缺失；而客户端（CodeBuddy/ZCode/WorkBuddy/OpenCode）
+// 是按官方 OpenAI 规范用 schema 校验的，非字符串 id 会直接报
+// 「响应数据无效 / Expected 'id' to be a string」并让整轮对话失败。
+// 既然流量经过我们中转，就有责任把响应规范到客户端期望的形状——
+// 这里对 id / object / created 做兜底，合规的上游字段原样保留，不产生任何改写。
+export function createChatSSEPassthrough(model, id, created) {
   let usage = null;
+  const fallbackId = (typeof id === 'string' && id.trim()) ? id : '';
+  const fallbackCreated = Number.isFinite(Number(created)) ? Number(created) : 0;
+  // 同一条流内保持 id / created 稳定，避免每块都变导致客户端当作新消息
+  let stableId = fallbackId;
+  let stableCreated = fallbackCreated;
+
+  const ensureId = (value) => {
+    if (typeof value === 'string' && value.trim()) return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    if (!stableId) stableId = `chatcmpl-${crypto.randomUUID()}`;
+    return stableId;
+  };
+  const ensureCreated = (value) => {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return n;
+    if (!stableCreated) stableCreated = Math.floor(Date.now() / 1000);
+    return stableCreated;
+  };
+
   return {
     write(event) {
       if (!event || typeof event !== 'object' || !Array.isArray(event.choices)) return [];
       if (event.usage) usage = event.usage;
-      return [{ ...event, model }];
+      return [{
+        ...event,
+        id: ensureId(event.id),
+        // 流式出口只可能是 chunk；上游偶有写成 chat.completion 的，统一纠正
+        object: 'chat.completion.chunk',
+        created: ensureCreated(event.created),
+        model,
+      }];
     },
     flush() { return []; },
     getUsage() { return usage; },
@@ -222,5 +257,5 @@ export function createChatSSEConverter(conn, model, id, created) {
   if (conn?.format === 'anthropic') return createChatSSEFromAnthropic(model, id, created);
   const path = String(conn?.apiPath || '').toLowerCase();
   if (path.includes('/responses') || conn?.unlockKind === 'codex') return createChatSSEFromResponses(model, id, created);
-  return createChatSSEPassthrough(model);
+  return createChatSSEPassthrough(model, id, created);
 }

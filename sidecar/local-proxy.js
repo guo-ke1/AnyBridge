@@ -388,17 +388,32 @@ function routeAliases(route, options = {}) {
   return aliases;
 }
 
-/** 构建"对外暴露 ID → 原始 route"查找表,供 resolveProxyModel 做反向解析。*/
+/** 构建"对外暴露 ID → 原始 route"查找表,供 resolveProxyModel 做反向解析。
+ * 两段式构建:字面 ID 是路由的权威身份,优先登记;命名规则渲染出的别名是二级别名,
+ * 与已有条目冲突时让位并告警。禁止因单一别名冲突抛错——查找表是全路由共享的,
+ * 抛错会把一条路由的配置打架放大成所有模型的请求全部失败。 */
 function buildExposedIdLookup(routes, options = {}) {
   const lookup = new Map();
+  // 第一遍:字面 ID。两条路由的字面 ID 相同是真重复,必须报错。
   for (const route of routes) {
-    for (const alias of routeAliases(route, options)) {
-      const previous = lookup.get(alias);
-      if (previous && previous !== route) {
-        throw new Error(`本地代理暴露模型 ID 冲突: ${alias} 同时匹配 ${previous.id} 和 ${route.id}。请调整模型 ID 或命名规则。`);
-      }
-      lookup.set(alias, route);
+    const literal = String(route.id || '').trim();
+    if (!literal) continue;
+    const previous = lookup.get(literal);
+    if (previous && previous !== route) {
+      throw new Error(`本地代理暴露模型 ID 冲突: ${literal} 同时是 ${previous.id} 和 ${route.id} 两条路由的字面 ID。请调整模型 ID 或命名规则。`);
     }
+    lookup.set(literal, route);
+  }
+  // 第二遍:渲染别名。冲突时跳过(字面 ID 已被其他路由占用),显式告警不静默。
+  for (const route of routes) {
+    const exposed = renderedProxyRouteId(route, options);
+    if (!exposed || exposed === route.id) continue;
+    const owner = lookup.get(exposed);
+    if (owner && owner !== route) {
+      console.warn(`[local-proxy] 暴露别名冲突已跳过: "${exposed}" 归属于路由 ${owner.id},路由 ${route.id} 的命名规则别名不生效。请调整模型 ID 或命名规则。`);
+      continue;
+    }
+    lookup.set(exposed, route);
   }
   return lookup;
 }
@@ -909,6 +924,19 @@ function routeAsSlot(route) {
   };
 }
 
+/** 目标是否指向内置本地代理自身（自环）。这类目标若直接发起请求会打到网关自己。 */
+function isLocalProxySelfTarget(target) {
+  const id = String(target?.providerId || '').trim().toLowerCase();
+  return id === 'anybridge-local-proxy' || id === 'anybridge';
+}
+
+/** 两条路由是否同一条：优先比 uid，退化为比 id。 */
+function sameRoute(a, b) {
+  if (!a || !b) return false;
+  if (a.uid && b.uid) return a.uid === b.uid;
+  return a.id === b.id;
+}
+
 function resolveAntigravityProxyModel(model, providers = loadProviders(), providersJson = readProvidersJson()) {
   const requested = String(model || '').trim();
   const customModel = resolveAntigravityCustomModel(requested, providersJson);
@@ -977,6 +1005,9 @@ export const __localProxyTest = {
   RETRYABLE_STATUS,
   buildExposedIdLookup,
   renderedProxyRouteId,
+  responseObject,
+  isLocalProxySelfTarget,
+  sameRoute,
   routeSupportsKind,
   normalizeRequest,
   normalizeOpenAI,
@@ -1919,7 +1950,35 @@ export async function execute(ctx) {
   const targets = enhancement.autoRouting === false ? [resolved.slot.targets[0]] : [...resolved.slot.targets];
   const policy = retryPolicy(enhancement);
   const failures = [];
+  // 自环目标（providerId = 内置本地代理）必须在进程内解析一层换成真实上游目标：
+  // 直接按原目标发请求会打到网关自己，形成"请求→本路由→网关→本路由"的无限环，
+  // 表现为整个代理被拖死。解析回本路由说明没有真实上游，显式报错而不是死循环。
+  const resolvedTargets = [];
   for (const target of targets) {
+    if (!isLocalProxySelfTarget(target)) {
+      resolvedTargets.push(target);
+      continue;
+    }
+    const inner = resolveProxyModel(target.model || '', 'chat', { scope });
+    if (inner.error || !inner.route) {
+      failures.push({ providerName: target.providerId, message: `自环目标模型 ${target.model || '(空)'} 无法解析: ${inner.error || '未命中路由'}` });
+      continue;
+    }
+    if (sameRoute(inner.route, resolved.route)) {
+      failures.push({
+        providerName: target.providerId,
+        message: `路由 ${resolved.route.id} 的目标指向本地代理自身，且模型 ${target.model} 仍解析回本路由，会形成无限请求环。请把该路由的目标改为真实供应商。`,
+      });
+      continue;
+    }
+    const innerTarget = inner.slot?.targets?.[0];
+    if (!innerTarget) {
+      failures.push({ providerName: target.providerId, message: `自环目标模型 ${target.model} 对应的路由 ${inner.route.id} 没有可用目标` });
+      continue;
+    }
+    resolvedTargets.push(innerTarget);
+  }
+  for (const target of resolvedTargets) {
     const conn = resolveTarget(target, providers);
     if (conn.error) { failures.push({ providerName: target.providerId, message: conn.error }); continue; }
     recordRequest({ provider: conn.providerName, requestedModel: ctx.model, resolvedModel: conn.model });
@@ -2266,7 +2325,23 @@ function responseObject(ctx, result, id) {
   const usage = { input_tokens: input, output_tokens: output, total_tokens: input + output };
   const cached = Number(result.usage?.cachedTokens) || 0;
   if (cached > 0) usage.input_tokens_details = { cached_tokens: cached };
-  return { id, object: 'response', created_at: Math.floor(Date.now() / 1000), status: 'completed', model: ctx.model, output_text: result.text, output: [{ type: 'message', id: `msg-${crypto.randomUUID()}`, status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: result.text }] }], usage };
+  // tool_calls 必须进 output（Responses 协议的 function_call 项），
+  // 否则 Cursor/Agent 这类工具调用客户端只会看到空 message，表现为"模型不回复"。
+  const outputItems = [{
+    type: 'message', id: `msg-${crypto.randomUUID()}`, status: 'completed', role: 'assistant',
+    content: [{ type: 'output_text', text: result.text }],
+  }];
+  for (const tc of (Array.isArray(result.toolCalls) ? result.toolCalls : [])) {
+    if (!tc?.name) continue;
+    outputItems.push({
+      type: 'function_call',
+      id: `fc_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+      call_id: tc.id || `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+      name: tc.name,
+      arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments ?? {}),
+    });
+  }
+  return { id, object: 'response', created_at: Math.floor(Date.now() / 1000), status: 'completed', model: ctx.model, output_text: result.text, output: outputItems, usage };
 }
 
 function sendOpenAIResponses(ctx, res, result) {
@@ -2317,6 +2392,13 @@ function sendOpenAIResponses(ctx, res, result) {
     sse(res, 'response.output_text.delta', { type: 'response.output_text.delta', item_id: obj.output[0].id, output_index: 0, content_index: 0, delta: result.text });
     sse(res, 'response.output_text.done', { type: 'response.output_text.done', item_id: obj.output[0].id, output_index: 0, content_index: 0, text: result.text });
     sse(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: 0, item: obj.output[0] });
+    // function_call 等附加 output item 必须以 output_item 事件发出，
+    // 否则工具调用客户端收不到任何调用指令，表现为空回复。
+    for (let i = 1; i < obj.output.length; i++) {
+      const item = obj.output[i];
+      sse(res, 'response.output_item.added', { type: 'response.output_item.added', output_index: i, item: { ...item, status: 'in_progress' } });
+      sse(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: i, item });
+    }
     sse(res, 'response.completed', { type: 'response.completed', response: obj });
     res.write('data: [DONE]\n\n'); res.end(); return;
   }
@@ -2326,7 +2408,15 @@ function sendOpenAIResponses(ctx, res, result) {
 function sendAnthropic(ctx, res, result) {
   const extra = result.extraHeaders || {};
   const echoModel = ctx.originalModel || ctx.model;
-  const messageId = result.json?.id || `msg_${crypto.randomUUID().replace(/-/g, '')}`;
+  // 上游 id 可能是数字/其它类型（第三方中转站常见），而 Anthropic 规范的 message.id
+  // 必须是字符串，客户端 schema 校验会直接失败（Expected 'id' to be a string）。
+  // 这里统一收敛：字符串原样用，其它非空标量转字符串，缺失才自己生成。
+  const rawMessageId = result.json?.id;
+  const messageId = typeof rawMessageId === 'string' && rawMessageId.trim()
+    ? rawMessageId
+    : ((typeof rawMessageId === 'number' || typeof rawMessageId === 'bigint') && String(rawMessageId).trim()
+      ? String(rawMessageId)
+      : `msg_${crypto.randomUUID().replace(/-/g, '')}`);
 
   let content = [];
   let stopReason = 'end_turn';

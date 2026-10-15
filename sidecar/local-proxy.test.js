@@ -8,6 +8,97 @@ import { invalidate } from './config-cache.js';
 import { __localProxyTest } from './local-proxy.js';
 import { resolveTarget } from './provider-pool.js';
 
+test('buildExposedIdLookup: 字面 ID 优先,渲染别名冲突跳过并告警,不再毒化全局', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'anybridge-exposed-id-'));
+  const previousConfigDir = process.env.BYOK_CONFIG_DIR;
+  process.env.BYOK_CONFIG_DIR = dir;
+  invalidate('all');
+
+  try {
+    // 复刻线上事故配置:命名规则 suffix=({provider}) + 字面同名的另一条路由
+    fs.writeFileSync(path.join(dir, 'model-map.json'), JSON.stringify({
+      proxyRouteRenameRule: { enabled: true, mode: 'simple', suffix: '({provider})' },
+    }), 'utf8');
+    fs.writeFileSync(path.join(dir, 'providers.json'), JSON.stringify([
+      { id: 'ar', name: 'AnyRouter', apiHost: 'https://example.test', enabled: true },
+    ]), 'utf8');
+
+    const routes = [
+      { id: 'gpt-6-astra', targets: [{ providerId: 'ar', model: 'gpt-6-astra' }] },
+      { id: 'gpt-6-astra(AnyRouter)', targets: [{ providerId: 'ar', model: 'gpt-6-astra' }] },
+      { id: 'gemini-flash', targets: [{ providerId: 'ar', model: 'gemini-flash' }] },
+    ];
+
+    // 修复前:这里会 throw 并导致所有模型(包括 gemini-flash)的解析全部 502
+    const lookup = __localProxyTest.buildExposedIdLookup(routes);
+    assert.equal(lookup.get('gpt-6-astra'), routes[0]);
+    // 字面 ID 归属第二条路由,第一条路由渲染出的同名别名让位
+    assert.equal(lookup.get('gpt-6-astra(AnyRouter)'), routes[1]);
+    assert.equal(lookup.get('gemini-flash'), routes[2]);
+  } finally {
+    invalidate('all');
+    if (previousConfigDir === undefined) delete process.env.BYOK_CONFIG_DIR;
+    else process.env.BYOK_CONFIG_DIR = previousConfigDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('buildExposedIdLookup: 两条路由字面 ID 相同仍然报错(真重复)', () => {
+  const routes = [
+    { id: 'dup-model', targets: [{ providerId: 'p1', model: 'm1' }] },
+    { id: 'dup-model', targets: [{ providerId: 'p2', model: 'm2' }] },
+  ];
+  assert.throws(
+    () => __localProxyTest.buildExposedIdLookup(routes, { applyRename: false }),
+    /同时是 dup-model 和 dup-model 两条路由的字面 ID/,
+  );
+});
+
+test('自环目标识别: 只有内置本地代理算自环, 普通供应商不是', () => {
+  assert.equal(__localProxyTest.isLocalProxySelfTarget({ providerId: 'anybridge-local-proxy' }), true);
+  assert.equal(__localProxyTest.isLocalProxySelfTarget({ providerId: 'anybridge' }), true);
+  assert.equal(__localProxyTest.isLocalProxySelfTarget({ providerId: 'cpa-local' }), false);
+  assert.equal(__localProxyTest.isLocalProxySelfTarget({ providerId: 'p-import-cockpittools-1' }), false);
+  assert.equal(__localProxyTest.isLocalProxySelfTarget(null), false);
+});
+
+test('sameRoute: uid 优先, 缺失时退化比 id', () => {
+  assert.equal(__localProxyTest.sameRoute({ uid: 'uid-1', id: 'a' }, { uid: 'uid-1', id: 'a' }), true);
+  assert.equal(__localProxyTest.sameRoute({ uid: 'uid-1', id: 'a' }, { uid: 'uid-2', id: 'a' }), false);
+  assert.equal(__localProxyTest.sameRoute({ id: 'a' }, { id: 'a' }), true);
+  assert.equal(__localProxyTest.sameRoute({ id: 'a' }, { id: 'b' }), false);
+  assert.equal(__localProxyTest.sameRoute(null, { id: 'a' }), false);
+});
+
+test('responseObject: openai 上游的 tool_calls 必须转成 function_call 输出项', () => {
+  // 复刻线上事故:cursor-core /v1/responses + 无 wireApi 的 openai 上游返回工具调用
+  const ctx = { model: 'gemini-3.8-flash-high' };
+  const result = {
+    text: '',
+    toolCalls: [{ id: 'get_weather-1', name: 'get_weather', arguments: { city: '北京' } }],
+    usage: { inputTokens: 56, outputTokens: 57 },
+  };
+  const obj = __localProxyTest.responseObject(ctx, result, 'resp-test');
+  assert.equal(obj.output.length, 2);
+  assert.equal(obj.output[0].type, 'message');
+  const fc = obj.output[1];
+  assert.equal(fc.type, 'function_call');
+  assert.equal(fc.name, 'get_weather');
+  assert.equal(fc.call_id, 'get_weather-1');
+  // Responses 协议的 arguments 是 JSON 字符串
+  assert.deepEqual(JSON.parse(fc.arguments), { city: '北京' });
+});
+
+test('responseObject: 纯文本回复保持单一 message 输出项', () => {
+  const obj = __localProxyTest.responseObject(
+    { model: 'm' },
+    { text: '你好', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1 } },
+    'resp-test',
+  );
+  assert.equal(obj.output.length, 1);
+  assert.equal(obj.output[0].content[0].text, '你好');
+});
+
 test('paramOverrides maps public max_tokens alias to internal maxTokens', () => {
   const ctx = __localProxyTest.normalizeRequest('openai', {
     model: 'local-model',

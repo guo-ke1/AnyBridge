@@ -2,6 +2,41 @@
 
 All notable changes to AnyBridge will be documented in this file.
 
+## v0.5.34 - 2026-10-14
+
+- 修复客户端报「响应数据无效 / Expected 'id' to be a string」（错误码 10014）的问题：
+  - 成因：官方 API 的 `id` 一定是字符串，所以客户端（CodeBuddy/ZCode/WorkBuddy/OpenCode 等）的 schema 校验从不报错；一旦经 AnyBridge 中转到第三方供应商，上游可能返回数字 id、null 或干脆不带 id，而我们原先**原样透传**，客户端校验就失败了。
+  - Chat SSE 透传路径现在会规范化 `id`（非字符串就补一个 `chatcmpl-<uuid>`，同一条流内保持稳定）、`object` 固定为 `chat.completion.chunk`、`created` 兜底为数字。合规上游的字段原样保留，不做任何改写。
+  - Anthropic 出口的 `message.id` 同样收敛为字符串（数字也转成字符串，缺失才自己生成）。
+  - 补充单元测试覆盖：数字 id、缺失 id、id 稳定性、object/created 兜底。
+
+## v0.5.33 - 2026-10-14
+
+- 修复 Responses 请求中**省略 `type` 的 input 项被静默丢弃**：`responsesToChatCompletions` 只按 `item.type` 分支匹配，而 Responses API 允许 message 项只写 `role` / `content`（`type` 可省略）。这类项会掉进"谁都不认识"的分支被丢弃，最终上游收到**空 messages**（Gemini 系直接报 `contents is not specified` 400），客户端看到的是莫名其妙的 400。
+  - 修复：没有 `type` 但带 `role` 或 `content` 的项按 message 处理。
+  - 触发面：`wireApi: chat` 的供应商（走 Responses→Chat 转换）会命中；Cursor 自身请求带 `type: "message"`，不受影响。
+
+## v0.5.32 - 2026-10-14
+
+- 修复 Cursor 接管后「发消息一直转圈 / 无任何回复」：本地代理对**全路由表**构建「对外模型 ID → 路由」查找表时，只要有一条路由配置打架就整体抛错，导致**所有模型**（包括与该冲突毫无关系的模型）全部 502。
+  - 根因一（放大器）：`buildExposedIdLookup` 遇到冲突直接 throw，而查找表是所有模型共享的。已改为**两段式构建**：字面 ID 是路由的权威身份，优先登记；命名规则渲染出的别名是二级别名，与已有条目冲突时**让位并告警**。只有两条路由的字面 ID 真重复才报错。
+  - 根因二（冲突本身）：`model-map.json` 的命名规则 `suffix: "({provider})"` 会把路由 `gpt-6-astra` 渲染出别名 `gpt-6-astra(AnyRouter)`，而与「给 Cursor 添加本地代理模型」自动创建的字面同名路由撞车。
+  - 现在的保障：即使以后再出现一条撞名配置，也只影响那一条，不会拖垮整个代理。诊断时会明确打印 `暴露别名冲突已跳过` 并指出归属路由。
+
+- 修复 Cursor（Agent 模式）**带工具调用的消息没有任何回复**：纯文本对话正常，一旦模型需要调用工具（例如让它读文件再改）就表现为"模型不回复"。
+  - 根因：`/v1/responses` 对未配置 `wireApi: chat` 的 OpenAI 上游（如 CPA 本地网关）走「非流式/假流式」路径，这条路径只把 message 项放进 `output`，`result.toolCalls` 被丢弃；假流式 SSE 也只发 message 事件，不发 `function_call` 的 `output_item` 事件。
+  - 修复：`responseObject()` 把工具调用转成 Responses 协议的 `function_call` 项；假流式分支补发对应的 `output_item.added/done` 事件。工具调用链路恢复正常，连续对话不再中断。
+
+- 修复「指向本地代理自身的路由」形成自环：`providerId = anybridge-local-proxy` 的目标会让请求打到网关自己（`请求→本路由→网关→本路由`）。现在这类目标在进程内解析一层换成真实上游目标；若解析回本路由（说明没有真实上游）则**显式报错**，不再靠自环请求硬扛。
+
+## v0.5.31 - 2026-10-13
+
+- 修复 macOS 上「安装证书 / 清理并重装」必须管理员授权、授权失败后把可用状态搞坏的问题：
+  - 根因一：macOS 的 `security add-trusted-cert` 带了 `-d`，那是「写入**管理员**信任设置」，会让本该免密的用户级安装也要求管理员密码。已去掉 `-d`，用户级安装恢复为真正的免密路径。
+  - 根因二：允许提权时会跳过用户级直接要管理员授权，而这个「跳过」的理由是 Windows 专属的（避免 Windows 安全警告弹窗），在 macOS 上并不成立。现在 macOS 上**先试用户级（login keychain），失败才提权**，多数用户不再需要输入管理员密码。
+  - 提权被拒时（常见原因是没看到系统弹窗）不再只回一句原始错误，而是：说清当前状态（证书已重生但信任库没有、IDE 会报 bad certificate），并给出**本平台可直接复制的手动安装命令**（macOS: 钥匙串访问设为「始终信任」或 `sudo security add-trusted-cert ...`；Windows: `certutil -addstore Root`；Linux: `update-ca-certificates`）。
+  - 提权前先提示「接下来会弹系统授权窗口，可能被其它窗口挡住或在另一个桌面」，减少「没看到弹窗」。
+
 ## v0.5.30 - 2026-10-13
 
 - 修复「IDE 里看不到自备模型」最常被卡住的一环：IDE 写入代理配置后必须重启才生效，但产品没有把这件事闭环。
