@@ -2562,6 +2562,7 @@ pub fn detect_target_ide() -> String {
     // macOS/Linux 同样检查代理配置
     #[cfg(target_os = "macos")]
     {
+        use std::path::PathBuf;
         // macOS: Windsurf/Devin 配置在 ~/Library/Application Support/
         let support_dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
 
