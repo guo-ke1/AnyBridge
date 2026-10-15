@@ -1873,6 +1873,7 @@ pub fn set_windsurf_path(path: String) -> Result<(), String> {
 
 /// 沙箱兼容标记：记录某平台因 Chromium 沙箱初始化失败而需要 --no-sandbox 启动。
 /// 存储于应用数据目录的 sandbox_compat.json，按平台 ID 记录布尔值。
+#[cfg(target_os = "windows")]
 fn sandbox_compat_flag(platform: &str) -> bool {
     if let Some(dir) = dirs::data_dir() {
         let p = dir.join("AnyBridge").join("sandbox_compat.json");
@@ -1885,6 +1886,7 @@ fn sandbox_compat_flag(platform: &str) -> bool {
     false
 }
 
+#[cfg(target_os = "windows")]
 fn set_sandbox_compat_flag(platform: &str, enabled: bool) {
     if let Some(dir) = dirs::data_dir() {
         let dir = dir.join("AnyBridge");

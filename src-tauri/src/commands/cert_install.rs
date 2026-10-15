@@ -21,6 +21,7 @@ use tauri::{AppHandle, Emitter};
 use crate::commands::system::{CA_COMMON_NAME, LEGACY_CA_COMMON_NAMES};
 
 /// 普通 certutil 调用超时（秒）。避免 verifystore/addstore 卡死导致 UI「Step is still running」。
+#[cfg(target_os = "windows")]
 const CERTUTIL_CMD_TIMEOUT_SECS: u64 = 20;
 /// 显式安装/卸载整条任务超时（秒）。UAC 等待算在内。
 const CERT_TASK_TIMEOUT_SECS: u64 = 120;
