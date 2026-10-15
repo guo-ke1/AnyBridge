@@ -136,7 +136,7 @@ jobs:
           PY
 
       - name: Upload test disk image
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: AnyBridge-test-${{ matrix.target }}-${{ github.sha }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
