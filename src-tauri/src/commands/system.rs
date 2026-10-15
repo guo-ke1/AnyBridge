@@ -849,7 +849,8 @@ pub(crate) fn acquire_mitm_package_lock(
     exclusive: bool,
 ) -> Result<Option<MitmPackageLock>, String> {
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    // PermissionsExt 为锁文件收紧到仅当前用户可读写提供 set_mode。
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let lock_root = certs_dir.parent().unwrap_or(certs_dir);
     if exclusive {
         std::fs::create_dir_all(lock_root)
@@ -2561,8 +2562,6 @@ pub fn detect_target_ide() -> String {
     // macOS/Linux 同样检查代理配置
     #[cfg(target_os = "macos")]
     {
-        use std::path::PathBuf;
-        let config_dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         // macOS: Windsurf/Devin 配置在 ~/Library/Application Support/
         let support_dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
 

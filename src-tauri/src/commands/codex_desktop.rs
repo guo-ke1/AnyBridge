@@ -32,7 +32,10 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// Instant 仅用于 Windows Codex watcher 的冷却与超时计时。
+#[cfg(target_os = "windows")]
+use std::time::Instant;
 use tauri::AppHandle;
 
 #[cfg(target_os = "windows")]

@@ -1079,7 +1079,6 @@ struct MitmReadyReport {
 fn ensure_proxy_mitm_ready_once() -> Result<String, String> {
     // 先确认磁盘包完整，再按其 CA 指纹检查系统信任，避免校验另一份证书材料。
     let certs_dir = crate::commands::system::validate_existing_mitm_package()?;
-    let cert_path = certs_dir.join("server.codeium.com.pem");
     // 代理启动属于后台路径：只检查当前 CA 是否已经可信，不自动弹出 macOS
     // 管理员授权。信任变更必须由环境检测中的显式用户操作完成。
     let status = crate::commands::cert_install::check_ca_status_fresh();
@@ -2631,8 +2630,10 @@ pub fn start_proxy_impl(
                     }
                 }
             }
-            let mut c = std::process::Command::new(&sidecar_path);
-            // Windows: 设置进程创建标志，阻止 CMD 窗口弹出
+            let c = std::process::Command::new(&sidecar_path);
+            // 仅 Windows 的 creation_flags 需要可变 Command；Unix 保持不可变以避免平台警告。
+            #[cfg(target_os = "windows")]
+            let mut c = c;
             #[cfg(target_os = "windows")]
             c.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
             c
@@ -3029,7 +3030,9 @@ fn start_proxy_service_impl_with_repair(
                     }
                 }
             }
-            let mut c = std::process::Command::new(&sidecar_path);
+            let c = std::process::Command::new(&sidecar_path);
+            #[cfg(target_os = "windows")]
+            let mut c = c;
             #[cfg(target_os = "windows")]
             c.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
             c
